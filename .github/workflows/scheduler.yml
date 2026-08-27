@@ -1,0 +1,120 @@
+# scheduler — the external cron that replaces the dead `schedule` trigger.
+#
+# Context (research/A2A-VALIDATION.md §5 in the private repo): the private
+# repo's `schedule` trigger has NEVER fired (zero event=schedule runs repo-wide
+# across 6+ missed ticks and two cron re-registrations). The swarm-lead monitor
+# sweep therefore lost its driver. This workflow is the replacement driver,
+# running on FREE public-repo compute with zero private-quota consumption:
+#
+#   every 30 min (cron) → smart scan of the private repo's open issues →
+#   only when a genuinely stalled a2a marker is found → one repository_dispatch
+#   to the private repo's lead sweep with the issue number.
+#
+# Private-repo quota is spent ONLY on actual stalls (a synthetic turn), not on
+# monitoring cadence (~48 no-op sweeps/day would otherwise burn ~1,400 min/mo
+# against the 2,000 free-plan budget).
+#
+# This workflow doubles as the public-repo schedule liveness probe: if it never
+# fires, `schedule` is broken account-wide (not just on the private repo) and
+# the driver must move to an external HTTP cron (any pinger service can POST
+# /repos/<owner>/<repo>/dispatches with a PAT).
+#
+# LOG HYGIENE (public repo — every line is world-readable):
+#   - issue NUMBERS only; never titles, bodies, comment text, or usernames
+#   - never echo secret values; never cat private-repo file contents
+name: External scheduler (swarm sweep driver)
+
+on:
+  schedule:
+    # Off-peak minutes (avoid :00/:30 — GitHub's highest-load cron slots).
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: none
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PRIVATE_REPO: xfnwfpho1/cc-gha-exploration
+      GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}
+      GH_PAGER: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Scan private repo for stalled a2a markers
+        id: scan
+        run: |
+          set -e
+          # Agent roster: fetched LIVE from the private repo (no sync drift).
+          REGISTRY=$(gh api "repos/${PRIVATE_REPO}/contents/.github/agents/registry.json" --jq '.content' | base64 -d)
+          AGENTS=$(printf '%s' "$REGISTRY" | jq -r '.agents[].agent_id' | paste -sd'|')
+          echo "registry loaded: $(printf '%s' "$REGISTRY" | jq '.agents | length') agents"
+          rm -f /tmp/stalled
+          # Open issues of the private repo, newest-updated first. Numbers only.
+          gh issue list -R "${PRIVATE_REPO}" --state open --limit 10 --json number,updatedAt \
+            --jq 'sort_by(.updatedAt) | reverse | .[] | "\(.number)"' | while read -r NUM; do
+            # Newest-end read: the comments API ignores sort/direction (verified
+            # live) — paginate then take the tail marker.
+            COMMENTS_JSON=$(gh api --paginate "repos/${PRIVATE_REPO}/issues/${NUM}/comments?per_page=100" 2>/dev/null || echo '[]')
+            LAST=$(printf '%s' "$COMMENTS_JSON" | jq '[.[] | select(.body | contains("<!-- a2a:"))] | last // empty')
+            [ -n "$LAST" ] && [ "$LAST" != "null" ] || continue
+            MARKER_JSON=$(printf '%s' "$LAST" | jq -r '.body' | node a2a-marker.mjs 2>/dev/null || echo null)
+            TO=$(printf '%s' "$MARKER_JSON" | jq -r '.to // empty')
+            MKIND=$(printf '%s' "$MARKER_JSON" | jq -r '.kind // empty')
+            MFROM=$(printf '%s' "$MARKER_JSON" | jq -r '.from // empty')
+            CREATED=$(printf '%s' "$LAST" | jq -r '.created_at')
+            case "$TO" in
+              ""|human) continue ;;
+            esac
+            case "$MKIND" in
+              notice|heartbeat) continue ;;
+            esac
+            # Re-nudge guard: our own unanswered nudge must not re-nudge.
+            if [ "$MFROM" = "lead" ] && [ "$MKIND" = "handoff" ]; then
+              echo "issue #${NUM}: last marker is the lead's own unanswered nudge — skip"
+              continue
+            fi
+            # In-flight check: recent run of the addressee's workflow = not stalled.
+            WF_FILE=$(printf '%s' "$REGISTRY" | jq -r --arg id "$TO" '.agents[] | select(.agent_id == $id) | .workflow' 2>/dev/null || echo "")
+            if [ -n "$WF_FILE" ]; then
+              INFLIGHT=$(gh run list -R "${PRIVATE_REPO}" --workflow "$WF_FILE" --limit 5 --json status,createdAt 2>/dev/null \
+                | jq --arg cutoff "$(date -u -d '-40 min' +%Y-%m-%dT%H:%M:%SZ)" '[.[] | select(.createdAt > $cutoff)] | length' || echo 0)
+              if [ "${INFLIGHT:-0}" -gt 0 ]; then
+                echo "issue #${NUM}: addressee workflow has ${INFLIGHT} recent run(s) — not stalled"
+                continue
+              fi
+            fi
+            # Answered check: a reply from the addressee after the marker.
+            ANSWERED=$(printf '%s' "$COMMENTS_JSON" | jq --arg to "$TO" --arg created "$CREATED" \
+              '[.[] | select(.created_at > $created) | select(.body | contains("from: " + $to))] | length')
+            AGE_MIN=$(( ($(date +%s) - $(date -d "$CREATED" +%s)) / 60 ))
+            echo "issue #${NUM}: last marker (kind=${MKIND}, ${AGE_MIN} min old, answered=${ANSWERED})"
+            if [ "$ANSWERED" = "0" ] && [ "$AGE_MIN" -ge 40 ] && [ "$AGE_MIN" -le 360 ]; then
+              echo "issue=${NUM}" > /tmp/stalled
+              echo "STALLED: issue #${NUM} waiting on an agent for ${AGE_MIN} min"
+              exit 0
+            fi
+          done
+          if [ -f /tmp/stalled ]; then
+            echo "issue=$(cat /tmp/stalled | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+          else
+            echo "issue=" >> "$GITHUB_OUTPUT"
+            echo "no stalls detected"
+          fi
+
+      - name: Dispatch private sweep (only when stalled)
+        if: steps.scan.outputs.issue != ''
+        run: |
+          set -e
+          echo "dispatching repository_dispatch {sweep} for issue #${{ steps.scan.outputs.issue }}"
+          gh api -X POST "repos/${PRIVATE_REPO}/dispatches" \
+            -f event_type="sweep" \
+            -f "client_payload[issue_number]=${{ steps.scan.outputs.issue }}"
+          echo "dispatch accepted (the private repo's lead sweep takes it from here —
+                its reply lands on the private issue thread; nothing sensitive
+                appears in this public log)"

@@ -1,0 +1,57 @@
+# smoke — proof-of-mechanics for the public-executor pattern.
+#
+# Proves, on an UNLIMITED-FREE public runner:
+#   1. Secrets set on a PUBLIC repo are injected into runs but never printed
+#      (GitHub masks secret values in logs) — and are never readable via any
+#      API by the public.
+#   2. The runner can authenticate to the PRIVATE repo with a PAT secret and
+#      drive its control plane (read metadata, dispatch workflows).
+#   3. The whole thing costs ZERO private-repo minutes.
+#
+# Trigger: workflow_dispatch ONLY — never add issue_comment / pull_request /
+# pull_request_target / workflow_run triggers to this repo: on a public repo
+# those are attacker-reachable surfaces (see README security model).
+name: Executor smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: none
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Secret masking proof
+        env:
+          SMOKE: ${{ secrets.SMOKE_TEST_SECRET }}
+        run: |
+          echo "1. This line prints the secret value directly:"
+          echo "   secret = ${SMOKE}"
+          echo "   (GitHub masks registered secret values in ALL log output —"
+          echo "    the value above renders as ***)"
+          echo "2. Length-only disclosure (structure, not content):"
+          echo "   secret length = ${#SMOKE} chars"
+
+      - name: Private-repo access proof (PAT round-trip)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}
+        run: |
+          set -e
+          echo "3. Authenticating to the PRIVATE repo with the PAT secret:"
+          PRIV=$(gh api repos/xfnwfpho1/cc-gha-exploration --jq '.private')
+          echo "   private repo reachable: private=${PRIV}"
+          [ "$PRIV" = "true" ] || { echo "::error::expected the target repo to be private"; exit 1; }
+          echo "4. PAT can drive the private control plane (dispatching the 5-second"
+          echo "   schedule-probe workflow — proving authenticated cross-repo execution):"
+          gh workflow run schedule-probe.yml -R xfnwfpho1/cc-gha-exploration
+          echo "   dispatch accepted"
+
+      - name: Public-compute economics proof
+        run: |
+          echo "5. This job ran on a public runner: free, unlimited minutes."
+          echo "   Private-repo quota consumed by this run: 0 minutes."
+          echo "   (August 2026 usage on the private repo: ~583 of 2,000 free-plan"
+          echo "    minutes in 4 days — the economics that motivated this pattern.)"
