@@ -1,18 +1,34 @@
-# scheduler — the external cron that drives the swarm sweep.
+# scheduler — the external monitoring daemon for the A2A swarm.
 #
 # Context (research/A2A-GH-NATIVE.md §4 in the private repo): the native
 # `schedule` trigger is INTERMITTENT (multi-hour silent windows between partial
 # firing — revived 2026-08-28 after a fully-dead window). This workflow is the
-# PRIMARY driver,
-# running on FREE public-repo compute with zero private-quota consumption:
+# PRIMARY driver, running on FREE public-repo compute with zero private-quota
+# consumption.
 #
-#   every 30 min (cron) → smart scan of the private repo's open issues →
-#   only when a genuinely stalled a2a marker is found → one repository_dispatch
-#   to the private repo's lead sweep with the issue number.
+# Task 36 upgrade — from "stall scanner" to a 4-duty monitoring daemon
+# (docs/DIAGNOSTICS.md in the private repo is the runbook):
 #
-# Private-repo quota is spent ONLY on actual stalls (a synthetic turn), not on
-# monitoring cadence (~48 no-op sweeps/day would otherwise burn ~1,400 min/mo
-# against the 2,000 free-plan budget).
+#   1. STALL SCAN (unchanged semantics): every 30 min → scan the private
+#      repo's open issues for genuinely stalled a2a markers → dispatch ONE
+#      lead sweep. Private quota is spent ONLY on actual stalls (a synthetic
+#      turn), not monitoring cadence (~48 no-op sweeps/day would otherwise
+#      burn ~1,400 min/mo against the 2,000 free-plan budget).
+#   2. FAILURE WATCH (new): failed agent-workflow runs in the last 35 min are
+#      attributed to their issue via the run-name ("issue-N · agent" — set on
+#      the private repo's agent workflows), posted as a `[turn failed: run N]`
+#      notice comment on that issue (never a silent drop), and — for worker
+#      agents — trigger an immediate recovery sweep instead of waiting out the
+#      40-min stall window. Circuit breaker: ≥3 failure notices in 6h on one
+#      issue → notify-only (stop auto-recovery; human attention required).
+#   3. BOARD SYNC (new): the per-issue state (In Progress / Stalled / Idle /
+#      Failed + agent-on-hook) is mirrored onto the Projects v2 board — the
+#      operator's single dashboard. Graceful degradation: needs a `project`-
+#      scoped token (BOARD_PAT or an expanded GH_PAT_PRIVATE); without it the
+#      step logs a skip and the scheduler continues normally (audited
+#      2026-08-28: GH_PAT_PRIVATE carries repo+workflow only).
+#   4. QUOTA TELEMETRY (new): a monthly private-minutes estimate line
+#      (wall-clock sum of recent runs — a trend indicator, not billing).
 #
 # This workflow doubles as the public-repo schedule liveness probe: if it never
 # fires, `schedule` is broken account-wide (not just on the private repo) and
@@ -20,9 +36,10 @@
 # /repos/<owner>/<repo>/dispatches with a PAT).
 #
 # LOG HYGIENE (public repo — every line is world-readable):
-#   - issue NUMBERS only; never titles, bodies, comment text, or usernames
+#   - issue NUMBERS only; never titles, bodies, comment text, run names, or
+#     usernames (run names of older runs are commit subjects = content)
 #   - never echo secret values; never cat private-repo file contents
-name: External scheduler (swarm sweep driver)
+name: External scheduler (swarm monitoring daemon)
 
 on:
   schedule:
@@ -32,6 +49,12 @@ on:
 
 permissions:
   contents: none
+
+concurrency:
+  # Serialize scans: overlapping manual + cron scans would double-notice and
+  # double-dispatch. Queue (never cancel) — a scan is idempotent and cheap.
+  group: scheduler-scan
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -47,7 +70,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Scan private repo for stalled a2a markers
+      - name: Monitor scan (stalls + failed turns + board state)
         id: scan
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped: only this step holds the PAT
@@ -55,9 +78,39 @@ jobs:
           set -e
           # Agent roster: fetched LIVE from the private repo (no sync drift).
           REGISTRY=$(gh api "repos/${PRIVATE_REPO}/contents/.github/agents/registry.json" --jq '.content' | base64 -d)
-          AGENTS=$(printf '%s' "$REGISTRY" | jq -r '.agents[].agent_id' | paste -sd'|')
           echo "registry loaded: $(printf '%s' "$REGISTRY" | jq '.agents | length') agents"
-          rm -f /tmp/stalled
+          ROSTER=$(printf '%s' "$REGISTRY" | jq -r '[.agents[].agent_id] | join(",")')
+          rm -f /tmp/stalled /tmp/board-state.jsonl /tmp/failed-runs.jsonl
+
+          # ---- failure watch: failed agent-workflow runs in the window ------
+          # Attribution key: the private repo's agent workflows carry
+          # run-name "issue-N · <agent>" (Task 36); runs older than that
+          # change have no issue in their name and are unattributable (the
+          # stall scan still covers their issues after 40 min). Run NAMES are
+          # never logged — pre-change names are commit subjects (content).
+          CUTOFF=$(date -u -d '-35 min' +%Y-%m-%dT%H:%M:%SZ)
+          while read -r WF AGENT_ID; do
+            [ -n "$WF" ] || continue
+            gh run list -R "${PRIVATE_REPO}" --workflow "$WF" --limit 5 \
+              --json databaseId,name,conclusion,createdAt 2>/dev/null \
+              | jq -c --arg cutoff "$CUTOFF" --arg agent "$AGENT_ID" \
+                  '.[] | select(.conclusion == "failure" and .createdAt > $cutoff)
+                   | {run_id: .databaseId, agent: $agent,
+                      issue: ((.name | capture("issue-(?<n>[0-9]+)").n | tonumber) // null)}
+                   | select(.issue != null)' >> /tmp/failed-runs.jsonl || true
+          done < <(printf '%s' "$REGISTRY" | jq -r '.agents[] | "\(.workflow) \(.agent_id)"')
+          if [ -s /tmp/failed-runs.jsonl ]; then
+            # dedup by run_id (one run may appear once per scan it's inside)
+            jq -s 'unique_by(.run_id)' /tmp/failed-runs.jsonl > /tmp/failed.json
+            FAILED_COUNT=$(jq 'length' /tmp/failed.json)
+            echo "failure watch: ${FAILED_COUNT} failed agent run(s) in the last 35 min: $(jq -c '[.[] | {issue, agent, run_id}]' /tmp/failed.json)"
+          else
+            echo '[ ]' > /tmp/failed.json
+            echo "failure watch: 0 failed agent runs in the last 35 min"
+          fi
+          echo "failed_count=$(jq 'length' /tmp/failed.json)" >> "$GITHUB_OUTPUT"
+
+          # ---- stall scan + board state (all open issues, full pass) -------
           # Open issues of the private repo, newest-updated first. Numbers only.
           gh issue list -R "${PRIVATE_REPO}" --state open --limit 10 --json number,updatedAt \
             --jq 'sort_by(.updatedAt) | reverse | .[] | "\(.number)"' | while read -r NUM; do
@@ -71,36 +124,52 @@ jobs:
             MKIND=$(printf '%s' "$MARKER_JSON" | jq -r '.kind // empty')
             MFROM=$(printf '%s' "$MARKER_JSON" | jq -r '.from // empty')
             CREATED=$(printf '%s' "$LAST" | jq -r '.created_at')
+            AGE_MIN=$(( ($(date +%s) - $(date -d "$CREATED" +%s)) / 60 ))
+            # Answered check: a reply from the addressee after the marker.
+            ANSWERED=$(printf '%s' "$COMMENTS_JSON" | jq --arg to "$TO" --arg created "$CREATED" \
+              '[.[] | select(.created_at > $created) | select(.body | contains("from: " + $to))] | length')
+
+            board() { echo "{\"issue\": ${NUM}, \"status\": \"$1\", \"agent\": \"${2:-unassigned}\"}" >> /tmp/board-state.jsonl; }
+
             case "$TO" in
-              ""|human) continue ;;
+              ""|human) board Idle "$MFROM"; continue ;;
             esac
+            # Informational kinds are not requests waiting on anyone.
             case "$MKIND" in
-              notice|heartbeat) continue ;;
+              notice|heartbeat) board Idle "$MFROM"; continue ;;
             esac
             # Re-nudge guard: our own unanswered nudge must not re-nudge.
             if [ "$MFROM" = "lead" ] && [ "$MKIND" = "handoff" ]; then
-              echo "issue #${NUM}: last marker is the lead's own unanswered nudge — skip"
+              echo "issue #${NUM}: last marker is the lead's own unanswered nudge — skip (dispatch)"
+              # The BOARD still shows the truth: an unanswered nudge is stuck.
+              if [ "$ANSWERED" = "0" ] && [ "$AGE_MIN" -ge 40 ]; then board Stalled "$TO"; else board "In Progress" "$TO"; fi
               continue
             fi
             # In-flight check: recent run of the addressee's workflow = not stalled.
             WF_FILE=$(printf '%s' "$REGISTRY" | jq -r --arg id "$TO" '.agents[] | select(.agent_id == $id) | .workflow' 2>/dev/null || echo "")
+            INFLIGHT=0
             if [ -n "$WF_FILE" ]; then
               INFLIGHT=$(gh run list -R "${PRIVATE_REPO}" --workflow "$WF_FILE" --limit 5 --json status,createdAt 2>/dev/null \
                 | jq --arg cutoff "$(date -u -d '-40 min' +%Y-%m-%dT%H:%M:%SZ)" '[.[] | select(.createdAt > $cutoff)] | length' || echo 0)
               if [ "${INFLIGHT:-0}" -gt 0 ]; then
                 echo "issue #${NUM}: addressee workflow has ${INFLIGHT} recent run(s) — not stalled"
+                board "In Progress" "$TO"
                 continue
               fi
             fi
-            # Answered check: a reply from the addressee after the marker.
-            ANSWERED=$(printf '%s' "$COMMENTS_JSON" | jq --arg to "$TO" --arg created "$CREATED" \
-              '[.[] | select(.created_at > $created) | select(.body | contains("from: " + $to))] | length')
-            AGE_MIN=$(( ($(date +%s) - $(date -d "$CREATED" +%s)) / 60 ))
             echo "issue #${NUM}: last marker (kind=${MKIND}, ${AGE_MIN} min old, answered=${ANSWERED})"
-            if [ "$ANSWERED" = "0" ] && [ "$AGE_MIN" -ge 40 ] && [ "$AGE_MIN" -le 360 ]; then
-              echo "issue=${NUM}" > /tmp/stalled
-              echo "STALLED: issue #${NUM} waiting on an agent for ${AGE_MIN} min"
-              exit 0
+            if [ "$ANSWERED" != "0" ]; then
+              board Idle "$TO"
+            elif [ "$AGE_MIN" -lt 40 ]; then
+              board "In Progress" "$TO"
+            elif [ "$AGE_MIN" -le 360 ]; then
+              board Stalled "$TO"
+              if [ ! -f /tmp/stalled ]; then
+                echo "issue=${NUM}" > /tmp/stalled
+                echo "STALLED: issue #${NUM} waiting on an agent for ${AGE_MIN} min"
+              fi
+            else
+              board Idle "$TO"   # past the 360-min action window — at rest
             fi
           done
           if [ -f /tmp/stalled ]; then
@@ -110,6 +179,30 @@ jobs:
             echo "no stalls detected"
           fi
 
+          # ---- merge failure overrides into the board state ----------------
+          # Failed > any conversation-derived status; failed issues missing a
+          # board line (e.g. prefix-triggered turn without markers) get one.
+          if [ "$(jq 'length' /tmp/failed.json)" -gt 0 ]; then
+            jq -s --argjson failed "$(cat /tmp/failed.json)" '
+              . as $board
+              | ($failed | map({key: (.issue | tostring), value: .}) | from_entries) as $f
+              | ($board | map(if ($f[(.issue | tostring)] != null) then .status = "Failed" else . end)
+                 + ($f | to_entries
+                     | map(select((.key | tonumber) as $n | ($board | map(.issue) | index($n)) == null)
+                          | {issue: (.key | tonumber), status: "Failed", agent: .value.agent})))
+            ' /tmp/board-state.jsonl > /tmp/board-state-merged.jsonl 2>/dev/null && mv /tmp/board-state-merged.jsonl /tmp/board-state.jsonl \
+              || echo "board merge: kept unmerged state (${?})"
+          fi
+          echo "board state: $(wc -l < /tmp/board-state.jsonl 2>/dev/null || echo 0) active issue(s)"
+
+      - name: Board sync (Projects v2 mirror — graceful without project scope)
+        env:
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
+          BOARD_PAT: ${{ secrets.BOARD_PAT }}   # optional project-scoped override
+          PRIVATE_REPO: xfnwfpho1/cc-gha-exploration
+          ROSTER: default,researcher,coder,lead
+        run: bash scripts/board-sync.sh /tmp/board-state.jsonl
+
       - name: Dispatch private sweep (only when stalled)
         if: steps.scan.outputs.issue != ''
         env:
@@ -117,10 +210,83 @@ jobs:
           ISSUE: ${{ steps.scan.outputs.issue }}   # env-indirected, never ${{ }} into run:
         run: |
           set -e
+          T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "dispatching repository_dispatch {sweep} for issue #${ISSUE}"
           gh api -X POST "repos/${PRIVATE_REPO}/dispatches" \
             -f event_type="sweep" \
             -f "client_payload[issue_number]=${ISSUE}"
-          echo "dispatch accepted (the private repo's lead sweep takes it from here —
-                its reply lands on the private issue thread; nothing sensitive
-                appears in this public log)"
+          # 204 only means ACCEPTED — verify a run was actually created (the
+          # Task-35 review lesson: a silently dropped dispatch looks exactly
+          # like a successful one for ~30 min).
+          sleep 10
+          CREATED=$(gh run list -R "${PRIVATE_REPO}" --event repository_dispatch --limit 3 \
+            --json createdAt,status 2>/dev/null \
+            | jq --arg t0 "$T0" '[.[] | select(.createdAt > $t0)] | length' || echo 0)
+          if [ "${CREATED:-0}" -gt 0 ]; then
+            echo "sweep run created and visible (created_at > ${T0})"
+          else
+            echo "::warning::dispatch accepted but no repository_dispatch run appeared within 10s — check the private repo's lead workflow state"
+          fi
+
+      - name: Failure notices + recovery dispatches
+        if: steps.scan.outputs.failed_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}
+          STALLED_ISSUE: ${{ steps.scan.outputs.issue }}
+        run: |
+          set -e
+          jq -c '.[]' /tmp/failed.json | while read -r REC; do
+            ISSUE=$(printf '%s' "$REC" | jq -r '.issue')
+            RUN_ID=$(printf '%s' "$REC" | jq -r '.run_id')
+            AGENT_ID=$(printf '%s' "$REC" | jq -r '.agent')
+            # the stall dispatch (same scan) already covers this issue
+            if [ "$ISSUE" = "${STALLED_ISSUE}" ]; then
+              echo "issue #${ISSUE}: failure covered by the stall dispatch — notice only"
+            fi
+            RECENT=$(gh api "repos/${PRIVATE_REPO}/issues/${ISSUE}/comments?since=$(date -u -d '-6 hours' +%Y-%m-%dT%H:%M:%SZ)&per_page=100" 2>/dev/null || echo '[]')
+            # dedup: one notice per failed run id (prefix-exact — agent replies
+            # always start with the a2a marker, so they cannot collide)
+            DEDUP=$(printf '%s' "$RECENT" | jq --arg tag "**[turn failed: run ${RUN_ID}]**" '[.[] | select(.body | startswith($tag))] | length')
+            if [ "${DEDUP:-0}" -gt 0 ]; then
+              echo "issue #${ISSUE}: run ${RUN_ID} already noticed — skip"
+              continue
+            fi
+            NOTICES=$(printf '%s' "$RECENT" | jq '[.[] | select(.body | startswith("**[turn failed:"))] | length')
+            if [ "${NOTICES:-0}" -ge 3 ]; then
+              # circuit breaker: recurring failures → human attention, no auto-retry
+              RECUR=$(printf '%s' "$RECENT" | jq '[.[] | select(.body | startswith("**[turn failed: recurring]**"))] | length')
+              if [ "${RECUR:-0}" = "0" ]; then
+                gh issue comment "$ISSUE" -R "${PRIVATE_REPO}" --body "**[turn failed: recurring]** (auto — this notice triggers no agent turns) ${NOTICES} agent-turn failures in the last 6 hours on this thread. Auto-recovery is PAUSED — a human should check the run logs and docs/DIAGNOSTICS.md before re-triggering (mention an agent to retry manually)." || true
+              fi
+              echo "issue #${ISSUE}: circuit breaker open (${NOTICES} notices/6h) — no dispatch"
+              continue
+            fi
+            gh issue comment "$ISSUE" -R "${PRIVATE_REPO}" --body "**[turn failed: run ${RUN_ID}]** (auto — this notice triggers no agent turns) The ${AGENT_ID} turn started from this thread failed in CI (infra/transient — not a refusal; refusals post guard notices instead). The run log is in the private repo's Actions tab (run ${RUN_ID})." || true
+            echo "issue #${ISSUE}: posted failure notice for run ${RUN_ID} (${AGENT_ID})"
+            # recovery: immediate sweep for WORKER failures (the lead's own
+            # sweep failing must not dispatch another sweep — loop guard)
+            if [ "$AGENT_ID" != "lead" ] && [ "$ISSUE" != "${STALLED_ISSUE}" ]; then
+              T0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+              gh api -X POST "repos/${PRIVATE_REPO}/dispatches" \
+                -f event_type="sweep" \
+                -f "client_payload[issue_number]=${ISSUE}" && \
+                echo "recovery sweep dispatched for issue #${ISSUE} (run-created check skipped — the sweep's own notice/ledger covers it)"
+            fi
+          done
+
+      - name: Private-quota estimate (telemetry)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}
+        run: |
+          # Trend line, NOT billing: wall-clock sum of the newest ≤200 runs
+          # that started this calendar month (queue time included; billing
+          # measures per-job compute). The billing API needs an admin-scoped
+          # token (404 with repo-only — audited 2026-08-28).
+          MONTH_START=$(date -u +%Y-%m-01T00:00:00Z)
+          ESTIMATE=$(gh run list -R "${PRIVATE_REPO}" --limit 200 --json createdAt,updatedAt 2>/dev/null \
+            | jq --arg ms "$MONTH_START" \
+              '[.[] | select(.createdAt > $ms)]
+               | map(((.updatedAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)
+                    - (.createdAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601)) / 60)
+               | add // 0 | floor')
+          echo "private-minutes estimate: ~${ESTIMATE} min of wall-clock across the newest ≤200 runs since ${MONTH_START} (trend line, not billing)"
