@@ -71,16 +71,22 @@ jobs:
       - name: Clone private repo + restore session state (keys live only in this step)
         env:
           DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
-          DK_KIT: ${{ secrets.DEPLOY_KEY_KIT }}
+          DK_KIT: ${{ secrets.DEPLOY_KEY_KIT_RO }}
           RESUME_SID: ${{ github.event.inputs.resume_session_id }}
           BRANCH: ${{ github.event.inputs.branch }}
         run: |
+          # branch input validation (quoted anyway; this closes the question)
+          if ! printf '%s' "${BRANCH:-main}" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
+            echo "::error::branch must match ^[A-Za-z0-9._/-]+$" >&2; exit 1
+          fi
           # --- ssh: one key per host alias (SSH picks the key before the repo
           # path is known, so two github.com identities need two aliases)
           mkdir -p ~/.ssh
           printf '%s\n' "$DK_PRIVATE" > ~/.ssh/id_private
           printf '%s\n' "$DK_KIT"      > ~/.ssh/id_kit
           chmod 600 ~/.ssh/id_private ~/.ssh/id_kit
+          # UNCONDITIONAL shred: any failure below aborts with keys already gone
+          trap 'rm -f ~/.ssh/id_private ~/.ssh/id_kit' EXIT
           ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
           cat > ~/.ssh/config <<'CFG'
           Host gh-private
@@ -97,10 +103,14 @@ jobs:
           git config --global url."git@gh-kit:xfnwfpho1/claudecode-zai-agent-kit.git".insteadOf \
             "https://github.com/xfnwfpho1/claudecode-zai-agent-kit.git"
 
-          # --- clone (sanitized single-branch) + submodule via its own key
+          # --- clone (sanitized single-branch). FIXED PATH mirrors the private
+          # runner's workspace (/home/runner/work/<repo>/<repo>) so the encoded
+          # ~/.claude/projects dir matches — sessions resume ACROSS vehicles
+          # (private one-shot <-> executor) instead of failing cwd resolution.
+          WORK=/home/runner/work/cc-gha-exploration/cc-gha-exploration
           git clone --single-branch --branch "${BRANCH:-main}" \
-            git@gh-private:xfnwfpho1/cc-gha-exploration.git repo
-          cd repo
+            git@gh-private:xfnwfpho1/cc-gha-exploration.git "$WORK"
+          cd "$WORK"
           git submodule update --init
           echo "cloned: $(git rev-parse --short HEAD) ($(git ls-tree -r HEAD --name-only | wc -l) files)"
 
@@ -120,11 +130,15 @@ jobs:
             echo "agent-sessions branch not found (first run?)"
           fi
           RESTORED=0
+          RESTORE_SHA=""
           if git rev-parse --verify origin/agent-sessions >/dev/null 2>&1; then
             if git checkout origin/agent-sessions -- .agent-sessions/ && [ -d .agent-sessions/projects ]; then
               cp -r .agent-sessions/projects ~/.claude/projects
               RESTORED=1
-              echo "restored session state from agent-sessions"
+              RESTORE_SHA=$(git rev-parse origin/agent-sessions)
+              # 3-way merge base for the persist step (see persist)
+              echo "RESTORE_SHA=$RESTORE_SHA" >> "$GITHUB_ENV"
+              echo "restored session state from agent-sessions (base $RESTORE_SHA)"
             fi
           fi
           # a requested resume that cannot be restored is deterministic: fail loud
@@ -137,10 +151,11 @@ jobs:
             echo "resume target verified: ${RESUME_SID}.jsonl"
           fi
 
-          # --- SHRED the keys: the agent step below runs with bypassPermissions
-          # and must not be able to read or exfiltrate them.
+          # --- SHRED the keys (trap also fires on any failure above): the agent
+          # step below runs with bypassPermissions and must not read them.
           rm -f ~/.ssh/id_private ~/.ssh/id_kit
-          echo "deploy keys shredded; agent will run credential-less"
+          trap - EXIT
+          echo "deploy keys shredded; agent will run without git credentials"
 
       - name: Install Claude Code
         env:
@@ -155,7 +170,7 @@ jobs:
           npm install -g "@anthropic-ai/claude-code@${CC_VERSION}"
           claude --version
 
-      - name: "Run Agent Task (credential-less: no SSH keys, no tokens)"
+      - name: "Run Agent Task (no git credentials: keys shredded, model key only)"
         id: agent
         timeout-minutes: 25
         env:
@@ -170,7 +185,7 @@ jobs:
           MAX_CTX: ${{ github.event.inputs.max_context_tokens }}
           MAX_TURNS: ${{ github.event.inputs.max_turns }}
         run: |
-          cd repo
+          cd /home/runner/work/cc-gha-exploration/cc-gha-exploration
           # deadline pacing (Action 3): wall-clock signal before the step timeout
           OX_AGENT_DEADLINE_UTC=$(date -u -d "+$(( 25 * 60 - 120 )) seconds" "+%Y-%m-%dT%H:%M:%SZ")
           export OX_AGENT_DEADLINE_UTC
@@ -209,18 +224,37 @@ jobs:
           DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
           SESSION_ID: ${{ steps.agent.outputs.SESSION_ID }}
           RUN_ID: ${{ github.run_id }}
+          RESTORE_SHA: ${{ env.RESTORE_SHA }}
         run: |
-          cd repo
+          WORK=/home/runner/work/cc-gha-exploration/cc-gha-exploration
+          cd "$WORK" || { echo "no worktree (clone failed); skipping persist"; exit 0; }
           if [ ! -d ~/.claude/projects ]; then
             echo "no ~/.claude/projects (agent never started); skipping persist"
             exit 0
           fi
-          # re-materialize the private key for the fetch/push
-          printf '%s\n' "$DK_PRIVATE" > ~/.ssh/id_private
-          chmod 600 ~/.ssh/id_private
-          trap 'rm -f ~/.ssh/id_private' EXIT
-          git config user.name "executor-agent"
-          git config user.email "executor-agent@users.noreply.github.com"
+          # --- AGENT-TAMPER HARDENING: the agent (bypassPermissions) ran on this
+          # filesystem before us. Trust NOTHING it could have planted:
+          #   GIT_CONFIG_GLOBAL/SYSTEM=/dev/null -> ignores a rewritten ~/.gitconfig
+          #     (e.g. url.<attacker>.insteadOf re-routing our push)
+          #   core.hooksPath=/dev/null + --no-verify -> ignores planted .git/hooks/*
+          #   GIT_SSH_COMMAND with -F /dev/null -> ignores a rewritten ~/.ssh/config
+          #     (e.g. ProxyCommand exfil); fresh known_hosts + StrictHostKeyChecking
+          #   remote URL assert -> the push target is exactly what we cloned
+          printf '%s\n' "$DK_PRIVATE" > /tmp/persist_key
+          chmod 600 /tmp/persist_key
+          ssh-keyscan -t ed25519 github.com > /tmp/persist_known_hosts 2>/dev/null
+          export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+          export GIT_SSH_COMMAND="ssh -i /tmp/persist_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/persist_known_hosts -F /dev/null"
+          trap 'rm -f /tmp/persist_key' EXIT
+          EXPECTED_URL="git@gh-private:xfnwfpho1/cc-gha-exploration.git"
+          ACTUAL_URL=$(git remote get-url origin)
+          if [ "$ACTUAL_URL" != "$EXPECTED_URL" ]; then
+            echo "::error::origin URL differs from the clone-time value — refusing to push" >&2
+            exit 1
+          fi
+          # all git calls below go through hardened wrappers (no hooks, no
+          # global config, explicit identity)
+          G() { git -c user.name="executor-agent" -c user.email="executor-agent@users.noreply.github.com" -c core.hooksPath=/dev/null "$@"; }
           mkdir -p .agent-sessions
           rm -rf .agent-sessions/projects
           cp -r ~/.claude/projects .agent-sessions/projects
@@ -243,19 +277,42 @@ jobs:
               done
             fi
           }
-          # the agent step may have raced a private-repo persist: refetch the tip
+          # 3-WAY REFRESH (ported from agent-turn action.yml, round 34): per
+          # .agent-sessions file present on both sides, if OUR copy is
+          # unchanged since RESTORE_SHA take the REMOTE's version (a concurrent
+          # writer advanced it). Absent-only carry-forward could not do this
+          # and live-reverted a concurrent writer's turn pointer (round-33/34
+          # bug class — the corpus is SHARED with the private repo's A2A agents).
+          three_way_refresh() {
+            git rev-parse --verify origin/agent-sessions >/dev/null 2>&1 || return 0
+            local remote_sha
+            remote_sha=$(git rev-parse origin/agent-sessions)
+            [ -n "${RESTORE_SHA:-}" ] || return 0
+            [ "$remote_sha" = "$RESTORE_SHA" ] && return 0
+            git ls-tree -r --name-only origin/agent-sessions -- .agent-sessions | while IFS= read -r f; do
+              [ -f "$f" ] || continue
+              local_hash=$(git hash-object "$f")
+              base_hash=$(git rev-parse "${RESTORE_SHA}:${f}" 2>/dev/null || echo none)
+              if [ "$local_hash" = "$base_hash" ]; then
+                git checkout origin/agent-sessions -- "$f" 2>/dev/null || true
+              fi
+            done
+          }
+          # the agent step may have raced a private-repo persist: refetch fresh
           git fetch origin "+agent-sessions:refs/remotes/origin/agent-sessions" --depth=1 2>/dev/null || true
+          three_way_refresh
           carry_forward
           git add -A
           if git diff --cached --quiet; then
             echo "nothing to commit; session state unchanged"
             exit 0
           fi
-          git commit -m "executor: session ${SID:-unknown} (public run $RUN_ID)"
+          MTAG="[merge]"
+          G commit --no-verify -m "executor: session ${SID:-unknown} (public run $RUN_ID)"
           # append-only merge onto the fetched tip (same as the private variant)
           if git rev-parse --verify origin/agent-sessions >/dev/null 2>&1; then
             MERGE_PARENT=$(git rev-parse origin/agent-sessions)
-            NEW_COMMIT=$(git commit-tree HEAD^{tree} -p HEAD -p "$MERGE_PARENT" -m "executor: session ${SID:-unknown} (public run $RUN_ID) [merge]")
+            NEW_COMMIT=$(git commit-tree HEAD^{tree} -p HEAD -p "$MERGE_PARENT" -m "executor: session ${SID:-unknown} (public run $RUN_ID) $MTAG")
             git update-ref refs/heads/session-head "$NEW_COMMIT"
           else
             git update-ref refs/heads/session-head HEAD
@@ -264,12 +321,16 @@ jobs:
             echo "session state appended to the private agent-sessions branch"
           else
             echo "push rejected (remote moved); re-syncing and retrying once"
-            git fetch origin "+agent-sessions:refs/remotes/origin/agent-sessions" --depth=1
+            if ! git fetch origin "+agent-sessions:refs/remotes/origin/agent-sessions" --depth=1; then
+              echo "::error::retry fetch failed — session NOT pushed (local commit retained in run log message only)" >&2
+              exit 1
+            fi
+            three_way_refresh
             carry_forward
             git add -A
-            git diff --cached --quiet || git commit -m "executor: carry-forward (public run $RUN_ID)"
+            git diff --cached --quiet || G commit --no-verify -m "executor: carry-forward (public run $RUN_ID)"
             MERGE_PARENT=$(git rev-parse origin/agent-sessions)
-            NEW_COMMIT=$(git commit-tree HEAD^{tree} -p HEAD -p "$MERGE_PARENT" -m "executor: session ${SID:-unknown} (public run $RUN_ID) [merge]")
+            NEW_COMMIT=$(git commit-tree HEAD^{tree} -p HEAD -p "$MERGE_PARENT" -m "executor: session ${SID:-unknown} (public run $RUN_ID) $MTAG")
             git update-ref refs/heads/session-head "$NEW_COMMIT"
             git push origin refs/heads/session-head:agent-sessions
           fi

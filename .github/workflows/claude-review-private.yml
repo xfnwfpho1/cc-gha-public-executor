@@ -10,14 +10,18 @@
 # LOG HYGIENE (public logs are world-readable):
 #   - the DIFF and the REVIEW TEXT are never echoed (private code + private
 #     deliverable). Both live in /tmp only; the review ships via the PAT API.
-#   - only opaque metadata (PR number, SHAs, token counts) is printed.
+#   - diff stats are AGGREGATE counts only (numstat summed) — not even file
+#     names reach the public log.
 #
 # SECURITY:
 #   - payload validation: pr_number must be numeric, SHAs must be hex-40
 #     (client_payload values never reach a shell unsanitized).
-#   - deploy key for git (repo-scoped, no API surface); PAT only for the
-#     final review POST. SSH keys shredded before the agent step.
+#   - READ-ONLY deploy keys for git (clone/fetch only — a leaked key cannot
+#     push anything anywhere); PAT only for the final review POST.
+#   - keys shredded (trap) before the review agent step; the review agent
+#     runs --permission-mode plan (no writes, no command execution).
 #   - trigger: repository_dispatch (owner-only actors can send it).
+#   - failure is never silent: a failure-signal comment lands on the private PR.
 name: Claude Review Private (public compute)
 
 on:
@@ -50,49 +54,74 @@ jobs:
           [ "$ok" = "1" ] || exit 1
           echo "reviewing PR #$PR_NUMBER base=${BASE_SHA:0:7} head=${HEAD_SHA:0:7}"
 
-      - name: Clone private repo at PR head (deploy key; shredded after)
+      - name: Clone private repo at the PR merge ref (RO keys, shredded after)
         env:
-          DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
-          DK_KIT: ${{ secrets.DEPLOY_KEY_KIT }}
+          DK_RO: ${{ secrets.DEPLOY_KEY_REVIEW_RO }}
+          DK_KIT_RO: ${{ secrets.DEPLOY_KEY_KIT_RO }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
           BASE_SHA: ${{ github.event.client_payload.base_sha }}
         run: |
           mkdir -p ~/.ssh
-          printf '%s\n' "$DK_PRIVATE" > ~/.ssh/id_private
-          printf '%s\n' "$DK_KIT"      > ~/.ssh/id_kit
-          chmod 600 ~/.ssh/id_private ~/.ssh/id_kit
+          printf '%s\n' "$DK_RO"    > ~/.ssh/id_ro
+          printf '%s\n' "$DK_KIT_RO" > ~/.ssh/id_kit_ro
+          chmod 600 ~/.ssh/id_ro ~/.ssh/id_kit_ro
+          # unconditional shred on any exit path
+          trap 'rm -f ~/.ssh/id_ro ~/.ssh/id_kit_ro' EXIT
           ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
           cat > ~/.ssh/config <<'CFG'
           Host gh-private
             HostName github.com
             User git
-            IdentityFile ~/.ssh/id_private
+            IdentityFile ~/.ssh/id_ro
             IdentitiesOnly yes
           Host gh-kit
             HostName github.com
             User git
-            IdentityFile ~/.ssh/id_kit
+            IdentityFile ~/.ssh/id_kit_ro
             IdentitiesOnly yes
           CFG
           git config --global url."git@gh-kit:xfnwfpho1/claudecode-zai-agent-kit.git".insteadOf \
             "https://github.com/xfnwfpho1/claudecode-zai-agent-kit.git"
-          git clone --no-checkout git@gh-private:xfnwfpho1/cc-gha-exploration.git repo
+          # sanitized clone: single-branch only (agent-sessions corpus must
+          # not ride along as refs)
+          git clone --no-checkout --single-branch \
+            git@gh-private:xfnwfpho1/cc-gha-exploration.git repo
           cd repo
-          git fetch origin "$BASE_SHA" "$HEAD_SHA" --depth=200
-          # the merge-base diff (same semantics as the PR merge-ref review)
-          git diff "$BASE_SHA" "$HEAD_SHA" > /tmp/review-diff.txt
-          git checkout -q "$HEAD_SHA"
+          # THE MERGE REF (server-computed post-merge result — the same ref
+          # actions/checkout uses for pull_request events): review what the PR
+          # will actually become, with base-side noise excluded. Fall back to
+          # the raw SHAs if the merge ref is absent (conflicting PR).
+          if git fetch origin "+refs/pull/${PR_NUMBER}/merge:pr-merge" --depth=200 2>/dev/null \
+             && git rev-parse --verify pr-merge >/dev/null 2>&1; then
+            MERGE_BASE=$(git rev-parse pr-merge^)
+            MERGE_HEAD=$(git rev-parse pr-merge)
+            git checkout -q pr-merge
+            echo "using server merge ref ${MERGE_HEAD:0:7} (base ${MERGE_BASE:0:7})"
+          else
+            git fetch origin "$BASE_SHA" "$HEAD_SHA" --depth=200
+            MERGE_BASE="$BASE_SHA"
+            MERGE_HEAD="$HEAD_SHA"
+            git checkout -q "$HEAD_SHA"
+            echo "merge ref unavailable — falling back to two-SHA diff"
+          fi
+          git diff "$MERGE_BASE" "$MERGE_HEAD" > /tmp/review-diff.txt
           git submodule update --init 2>/dev/null || echo "(submodule fetch failed — continuing without kit context)"
-          echo "diff stats: $(git diff --stat "$BASE_SHA" "$HEAD_SHA" | tail -1)"
-          # shred BEFORE the agent step (bypassPermissions must not see the keys)
-          rm -f ~/.ssh/id_private ~/.ssh/id_kit
+          # AGGREGATE stats only — file names of private code stay out of the log
+          FILES=$(git diff --numstat "$MERGE_BASE" "$MERGE_HEAD" | wc -l)
+          INS=$(git diff --numstat "$MERGE_BASE" "$MERGE_HEAD" | awk '{s+=$1} END {print s+0}')
+          DEL=$(git diff --numstat "$MERGE_BASE" "$MERGE_HEAD" | awk '{s+=$2} END {print s+0}')
+          echo "diff aggregate: ${FILES} files, +${INS}/-${DEL} lines"
+          # shred BEFORE the agent step (trap already covers failures)
+          rm -f ~/.ssh/id_ro ~/.ssh/id_kit_ro
+          trap - EXIT
 
       - name: Install Claude Code
         run: |
           npm install -g "@anthropic-ai/claude-code@2.1.241"
           claude --version
 
-      - name: Run review (credential-less; output to /tmp only)
+      - name: Run review (no git credentials; output to /tmp only)
         id: review
         timeout-minutes: 25
         env:
@@ -108,7 +137,7 @@ jobs:
           # never echo the diff or the review — public log
           set +e
           claude -p "$(cat <<'PROMPT'
-          Perform a rigorous code review of this pull request. The full diff is in /tmp/review-diff.txt; the repository is checked out at the PR head — read any file for context.
+          Perform a rigorous code review of this pull request. The full diff is in /tmp/review-diff.txt; the repository is checked out at the PR merge ref — read any file for context.
 
           Focus on:
           1. Correctness: bugs, race conditions, error handling, edge cases.
@@ -135,14 +164,14 @@ jobs:
           echo "review produced: $(wc -c < /tmp/review.md) bytes (content not echoed — private deliverable)"
           jq '{subtype, is_error, num_turns, duration_ms, usage: {output_tokens: .usage.output_tokens}}' /tmp/review-result.json
 
-      - name: POST review to the private PR (PAT; result never in public log)
+      - name: POST review to the private PR (PAT; retried; result never in public log)
         env:
           GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number }}
           HEAD_SHA: ${{ github.event.client_payload.head_sha }}
         run: |
           python3 - <<'EOF'
-          import json, os, urllib.request
+          import json, os, time, urllib.request
           pr = os.environ["PR_NUMBER"]
           pat = os.environ["GH_PAT_PRIVATE"]
           review = open("/tmp/review.md").read()
@@ -155,9 +184,51 @@ jobs:
               headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json",
                        "Content-Type": "application/json"},
               data=json.dumps(body).encode())
-          with urllib.request.urlopen(req) as r:
-              out = json.loads(r.read())
-              print(f"review posted: id={out['id']} state={out['state']} (url not echoed — private repo)")
+          last_err = None
+          for attempt in range(3):
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      out = json.loads(r.read())
+                      print(f"review posted: id={out['id']} state={out['state']} (attempt {attempt+1})")
+                      raise SystemExit(0)
+              except urllib.error.HTTPError as e:
+                  last_err = e
+                  if e.code in (403, 404):  # deterministic — do not retry
+                      raise
+                  time.sleep(5 * (attempt + 1))
+              except Exception as e:
+                  last_err = e
+                  time.sleep(5 * (attempt + 1))
+          print(f"::error::review POST failed after 3 attempts: {last_err}")
+          raise SystemExit(1)
+          EOF
+
+      - name: Signal failure to the private PR (never a silent drop)
+        if: failure()
+        env:
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          pr, pat = os.environ["PR_NUMBER"], os.environ["GH_PAT_PRIVATE"]
+          body = {"body": f"**Executor review FAILED** for head `{os.environ['HEAD_SHA'][:7]}` (public run {os.environ['RUN_ID']}). "
+                          "No automated review was produced — check the executor run log (metadata only), re-dispatch, "
+                          "or re-enable the private claude-review.yml fallback."}
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/xfnwfpho1/cc-gha-exploration/issues/{pr}/comments",
+              method="POST",
+              headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json",
+                       "Content-Type": "application/json"},
+              data=json.dumps(body).encode())
+          try:
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  print(f"failure signal posted to PR #{pr} (comment {r.status})")
+          except Exception as e:
+              print(f"::error::could not signal failure either: {e}")
+              raise SystemExit(1)  # the job is already failed; make the relay failure loud
           EOF
 
       - name: Report (metadata only)

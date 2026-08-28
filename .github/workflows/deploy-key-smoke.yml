@@ -2,8 +2,7 @@ name: deploy-key-smoke
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   deploy-key-proofs:
@@ -17,8 +16,10 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          # model the shred discipline the ports use (no agent step here, but
+          # this file is the reference implementation)
+          trap 'rm -f ~/.ssh/id_ed25519' EXIT
           ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
-          # never echo the key itself; fingerprint only (public half)
           ssh-keygen -lf ~/.ssh/id_ed25519 || true
 
       - name: "PROOF 1: SSH clone of the private repo via deploy key (no PAT)"
@@ -26,8 +27,7 @@ jobs:
           git clone --depth 5 --single-branch --branch main \
             git@github.com:xfnwfpho1/cc-gha-exploration.git private-repo
           cd private-repo
-          echo "cloned OK; HEAD:"
-          git log --oneline -1
+          echo "cloned OK; HEAD: $(git rev-parse HEAD)"
           echo "file count at HEAD: $(git ls-tree -r HEAD --name-only | wc -l)"
 
       - name: "PROOF 2: SSH push (git write surface) — branch off HEAD, force-push reset"

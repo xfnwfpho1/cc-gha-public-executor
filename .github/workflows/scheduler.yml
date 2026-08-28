@@ -1,9 +1,9 @@
-# scheduler — the external cron that replaces the dead `schedule` trigger.
+# scheduler — the external cron that drives the swarm sweep.
 #
-# Context (research/A2A-VALIDATION.md §5 in the private repo): the private
-# repo's `schedule` trigger has NEVER fired (zero event=schedule runs repo-wide
-# across 6+ missed ticks and two cron re-registrations). The swarm-lead monitor
-# sweep therefore lost its driver. This workflow is the replacement driver,
+# Context (research/A2A-GH-NATIVE.md §4 in the private repo): the native
+# `schedule` trigger is INTERMITTENT (multi-hour silent windows between partial
+# firing — revived 2026-08-28 after a fully-dead window). This workflow is the
+# PRIMARY driver,
 # running on FREE public-repo compute with zero private-quota consumption:
 #
 #   every 30 min (cron) → smart scan of the private repo's open issues →
@@ -39,15 +39,18 @@ jobs:
     timeout-minutes: 10
     env:
       PRIVATE_REPO: xfnwfpho1/cc-gha-exploration
-      GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}
       GH_PAGER: ""
     steps:
-      - uses: actions/checkout@v4
+      # SHA-pinned (a moved v4 tag would otherwise run with no PAT but still
+      # executes third-party code on this secret-holding runner)
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608  # v4.1.0
         with:
           persist-credentials: false
 
       - name: Scan private repo for stalled a2a markers
         id: scan
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped: only this step holds the PAT
         run: |
           set -e
           # Agent roster: fetched LIVE from the private repo (no sync drift).
@@ -109,12 +112,15 @@ jobs:
 
       - name: Dispatch private sweep (only when stalled)
         if: steps.scan.outputs.issue != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}  # step-scoped: only this step holds the PAT
+          ISSUE: ${{ steps.scan.outputs.issue }}   # env-indirected, never ${{ }} into run:
         run: |
           set -e
-          echo "dispatching repository_dispatch {sweep} for issue #${{ steps.scan.outputs.issue }}"
+          echo "dispatching repository_dispatch {sweep} for issue #${ISSUE}"
           gh api -X POST "repos/${PRIVATE_REPO}/dispatches" \
             -f event_type="sweep" \
-            -f "client_payload[issue_number]=${{ steps.scan.outputs.issue }}"
+            -f "client_payload[issue_number]=${ISSUE}"
           echo "dispatch accepted (the private repo's lead sweep takes it from here —
                 its reply lands on the private issue thread; nothing sensitive
                 appears in this public log)"
