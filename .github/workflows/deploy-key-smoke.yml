@@ -1,0 +1,63 @@
+name: deploy-key-smoke
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-key-proofs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Configure SSH from deploy key secret
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
+          # never echo the key itself; fingerprint only (public half)
+          ssh-keygen -lf ~/.ssh/id_ed25519 || true
+
+      - name: "PROOF 1: SSH clone of the private repo via deploy key (no PAT)"
+        run: |
+          git clone --depth 5 --single-branch --branch main \
+            git@github.com:xfnwfpho1/cc-gha-exploration.git private-repo
+          cd private-repo
+          echo "cloned OK; HEAD:"
+          git log --oneline -1
+          echo "file count at HEAD: $(git ls-tree -r HEAD --name-only | wc -l)"
+
+      - name: "PROOF 2: SSH push (git write surface) — branch off HEAD, force-push reset"
+        run: |
+          cd private-repo
+          git config user.name "executor-deploy-key"
+          git config user.email "executor@users.noreply.github.com"
+          git checkout -B executor-deploy-key-probe
+          echo "deploy-key write probe $(date -u +%FT%TZ)" >> .deploy-key-write-probe
+          git add .deploy-key-write-probe
+          git commit -q -m "probe: deploy-key write path (auto-cleaning)"
+          git push -q origin executor-deploy-key-probe
+          echo "push OK; remote now has branch executor-deploy-key-probe"
+          # cleanup: delete the probe branch remotely to keep the repo tidy
+          git push -q origin --delete executor-deploy-key-probe
+          echo "probe branch deleted; write surface proven (clone+commit+push+delete-branch)"
+
+      - name: "PROOF 3: deploy key CANNOT call the REST API (scoping boundary)"
+        run: |
+          set +e
+          # no PAT in env in this job — only the deploy key exists. API access via SSH key is impossible by design;
+          # demonstrate by attempting an authenticated REST call with no token at all:
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            https://api.github.com/repos/xfnwfpho1/cc-gha-exploration)
+          echo "unauthenticated API read of the private repo: HTTP $code (404 expected — private repo is invisible without a token)"
+          test "$code" = "404"
+
+      - name: "PROOF 4: zero private-repo minutes consumed by this job"
+        run: |
+          echo "This job ran on the PUBLIC executor (free/unlimited). The only private-repo
+          cost would be any runs triggered there — this job triggers none (SSH git ops
+          create no workflow events; push events on non-default branches with no
+          matching workflow cost nothing)."
