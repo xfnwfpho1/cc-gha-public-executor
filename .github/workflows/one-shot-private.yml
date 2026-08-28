@@ -266,9 +266,13 @@ jobs:
             echo "::error::origin URL differs from the clone-time value — refusing to push" >&2
             exit 1
           fi
+          # identity via ENV (applies to commit AND commit-tree — a live-caught
+          # gap: commit-tree ignores -c flags on the wrapper, run 33144216007)
+          export GIT_AUTHOR_NAME="executor-agent" GIT_AUTHOR_EMAIL="executor-agent@users.noreply.github.com"
+          export GIT_COMMITTER_NAME="executor-agent" GIT_COMMITTER_EMAIL="executor-agent@users.noreply.github.com"
           # all git calls below go through hardened wrappers (no hooks, no
-          # global config, explicit identity)
-          G() { git -c user.name="executor-agent" -c user.email="executor-agent@users.noreply.github.com" -c core.hooksPath=/dev/null "$@"; }
+          # global config)
+          G() { git -c core.hooksPath=/dev/null "$@"; }
           mkdir -p .agent-sessions
           rm -rf .agent-sessions/projects
           cp -r ~/.claude/projects .agent-sessions/projects
