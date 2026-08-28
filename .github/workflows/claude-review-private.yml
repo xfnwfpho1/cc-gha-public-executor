@@ -145,7 +145,7 @@ jobs:
           3. GitHub Actions semantics: YAML correctness, permissions, concurrency groups.
           4. Docs accuracy: claims that contradict the code.
 
-          Report findings as a numbered list with severity tags [P0]/[P1]/[P2]/[P3] and file:line citations. Ignore: credentials tracked in git (deliberate git-is-disk policy for this exploration repo) and informal tone. If nothing significant is wrong, say so plainly — do not pad. Your entire response is posted verbatim as the PR review; write it for that audience.
+          Report findings as a numbered list with severity tags [P0]/[P1]/[P2]/[P3] and file:line citations. Ignore: credentials tracked in git (deliberate git-is-disk policy for this exploration repo) and informal tone. If nothing significant is wrong, say so plainly — do not pad. Your entire response is posted verbatim as the PR review; write it for that audience. CRITICAL: include ALL findings inline in your response — there is NO other delivery channel (no 'findings posted above', no external files; anything not in your final response is lost).
           PROMPT
           )" \
             --output-format json \
