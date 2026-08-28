@@ -1,0 +1,62 @@
+# pat-scope-audit — one-shot diagnostic: what can GH_PAT_PRIVATE actually do?
+#
+# Task 36 context: the session PAT from the principal is repo+workflow only;
+# board-sync (Projects v2 GraphQL) needs `project`, discussion writes need
+# `write:discussion`. The executor's GH_PAT_PRIVATE may be the wider key.
+# This workflow answers that question WITHOUT exposing the token: it reads
+# the X-OAuth-Scopes response header (scope NAMES only — never values) and
+# probes each capability live, logging OK/FAIL lines only.
+#
+# LOG HYGIENE: scope names and OK/FAIL verdicts only. No token material,
+# no repo content, no titles/bodies.
+name: PAT scope audit (GH_PAT_PRIVATE)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: none
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Read OAuth scopes from response header
+        env:
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
+        run: |
+          echo "scopes: $(curl -s -I -H "Authorization: token ${GH_PAT_PRIVATE}" https://api.github.com/user | tr -d '\r' | awk 'tolower($1)=="x-oauth-scopes:"{$1=""; print}')"
+
+      - name: Probe Projects v2 read (board reachability)
+        env:
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
+        run: |
+          R=$(curl -s -X POST https://api.github.com/graphql \
+            -H "Authorization: bearer ${GH_PAT_PRIVATE}" -H "Content-Type: application/json" \
+            -d '{"query":"query { user(login: \"xfnwfpho1\") { projectV2(number: 1) { id title } } }"}')
+          if printf '%s' "$R" | jq -e '.data.user.projectV2.id' >/dev/null 2>&1; then
+            echo "board-read: OK"
+          else
+            echo "board-read: FAIL ($(printf '%s' "$R" | jq -r '.errors[0].type // "unknown"' 2>/dev/null))"
+          fi
+
+      - name: Probe discussion comment write (on the closed probe discussion #10 — replies are allowed on closed discussions)
+        env:
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
+        run: |
+          # Fetch discussion #10's node id + its last comment id in one query
+          Q=$(curl -s -X POST https://api.github.com/graphql \
+            -H "Authorization: bearer ${GH_PAT_PRIVATE}" -H "Content-Type: application/json" \
+            -d '{"query":"query { repository(owner: \"xfnwfpho1\", name: \"cc-gha-exploration\") { discussion(number: 10) { id comments(last: 1) { nodes { id } } } } }"}')
+          DID=$(printf '%s' "$Q" | jq -r '.data.repository.discussion.id // empty')
+          CID=$(printf '%s' "$Q" | jq -r '.data.repository.discussion.comments.nodes[0].id // empty')
+          if [ -z "$DID" ] || [ -z "$CID" ]; then echo "discussion-write: FAIL (no anchor comment found)"; exit 0; fi
+          R=$(curl -s -X POST https://api.github.com/graphql \
+            -H "Authorization: bearer ${GH_PAT_PRIVATE}" -H "Content-Type: application/json" \
+            -d "{\"query\":\"mutation(\$d: ID!, \$b: ID!) { addDiscussionComment(input: {discussionId: \$d, body: \\\"scope-audit probe (auto, safe to delete)\\\", replyToId: \$b}) { comment { id } } }\", \"variables\": {\"d\": \"${DID}\", \"b\": \"${CID}\"}}")
+          if printf '%s' "$R" | jq -e '.data.addDiscussionComment.comment.id' >/dev/null 2>&1; then
+            echo "discussion-write: OK"
+          else
+            echo "discussion-write: FAIL ($(printf '%s' "$R" | jq -r '.errors[0].type // "unknown"' 2>/dev/null))"
+          fi
