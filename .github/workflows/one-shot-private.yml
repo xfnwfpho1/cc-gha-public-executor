@@ -244,8 +244,22 @@ jobs:
           chmod 600 /tmp/persist_key
           ssh-keyscan -t ed25519 github.com > /tmp/persist_known_hosts 2>/dev/null
           export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
-          export GIT_SSH_COMMAND="ssh -i /tmp/persist_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/tmp/persist_known_hosts -F /dev/null"
-          trap 'rm -f /tmp/persist_key' EXIT
+          # FRESH ssh config at an unguessable mktemp path: carries the gh-private
+          # host-alias mapping (a bare -F /dev/null would break alias resolution —
+          # live-caught run 33144031287: push exit 128) while still ignoring the
+          # agent-writable ~/.ssh/config
+          SSHCFG=$(mktemp /tmp/persist-ssh.XXXXXX)
+          cat > "$SSHCFG" <<'SSSCFG'
+          Host gh-private
+            HostName github.com
+            User git
+            IdentityFile /tmp/persist_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile /tmp/persist_known_hosts
+          SSSCFG
+          export GIT_SSH_COMMAND="ssh -F $SSHCFG"
+          trap 'rm -f /tmp/persist_key $SSHCFG' EXIT
           EXPECTED_URL="git@gh-private:xfnwfpho1/cc-gha-exploration.git"
           ACTUAL_URL=$(git remote get-url origin)
           if [ "$ACTUAL_URL" != "$EXPECTED_URL" ]; then
