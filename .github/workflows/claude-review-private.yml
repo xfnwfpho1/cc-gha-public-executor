@@ -1,0 +1,165 @@
+# Claude PR review of the PRIVATE repo, executed on FREE PUBLIC compute.
+#
+# The relay: cc-gha-exploration/.github/workflows/review-relay.yml (a ~10s
+# private-side job) fires repository_dispatch {event_type: review} here with
+# {pr_number, head_sha, base_sha}. This workflow does the heavy part (clone,
+# diff, LLM review) on free public minutes and POSTs the review back to the
+# private PR via the PAT — replacing ~10 min of private compute per review
+# (claude-review.yml burned 283 private minutes in Aug 2026).
+#
+# LOG HYGIENE (public logs are world-readable):
+#   - the DIFF and the REVIEW TEXT are never echoed (private code + private
+#     deliverable). Both live in /tmp only; the review ships via the PAT API.
+#   - only opaque metadata (PR number, SHAs, token counts) is printed.
+#
+# SECURITY:
+#   - payload validation: pr_number must be numeric, SHAs must be hex-40
+#     (client_payload values never reach a shell unsanitized).
+#   - deploy key for git (repo-scoped, no API surface); PAT only for the
+#     final review POST. SSH keys shredded before the agent step.
+#   - trigger: repository_dispatch (owner-only actors can send it).
+name: Claude Review Private (public compute)
+
+on:
+  repository_dispatch:
+    types: [review]
+
+permissions: {}
+
+concurrency:
+  # a burst of pushes to the same PR: only the newest state matters — drop
+  # in-flight reviews of stale SHAs instead of queueing them.
+  group: review-${{ github.event.client_payload.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Validate dispatch payload
+        env:
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          BASE_SHA: ${{ github.event.client_payload.base_sha }}
+        run: |
+          ok=1
+          printf '%s' "$PR_NUMBER" | grep -Eq '^[0-9]+$' || { echo "::error::pr_number not numeric" >&2; ok=0; }
+          printf '%s' "$HEAD_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::head_sha not hex-40" >&2; ok=0; }
+          printf '%s' "$BASE_SHA" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::base_sha not hex-40" >&2; ok=0; }
+          [ "$ok" = "1" ] || exit 1
+          echo "reviewing PR #$PR_NUMBER base=${BASE_SHA:0:7} head=${HEAD_SHA:0:7}"
+
+      - name: Clone private repo at PR head (deploy key; shredded after)
+        env:
+          DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+          DK_KIT: ${{ secrets.DEPLOY_KEY_KIT }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          BASE_SHA: ${{ github.event.client_payload.base_sha }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DK_PRIVATE" > ~/.ssh/id_private
+          printf '%s\n' "$DK_KIT"      > ~/.ssh/id_kit
+          chmod 600 ~/.ssh/id_private ~/.ssh/id_kit
+          ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<'CFG'
+          Host gh-private
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/id_private
+            IdentitiesOnly yes
+          Host gh-kit
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/id_kit
+            IdentitiesOnly yes
+          CFG
+          git config --global url."git@gh-kit:xfnwfpho1/claudecode-zai-agent-kit.git".insteadOf \
+            "https://github.com/xfnwfpho1/claudecode-zai-agent-kit.git"
+          git clone --no-checkout git@gh-private:xfnwfpho1/cc-gha-exploration.git repo
+          cd repo
+          git fetch origin "$BASE_SHA" "$HEAD_SHA" --depth=200
+          # the merge-base diff (same semantics as the PR merge-ref review)
+          git diff "$BASE_SHA" "$HEAD_SHA" > /tmp/review-diff.txt
+          git checkout -q "$HEAD_SHA"
+          git submodule update --init 2>/dev/null || echo "(submodule fetch failed — continuing without kit context)"
+          echo "diff stats: $(git diff --stat "$BASE_SHA" "$HEAD_SHA" | tail -1)"
+          # shred BEFORE the agent step (bypassPermissions must not see the keys)
+          rm -f ~/.ssh/id_private ~/.ssh/id_kit
+
+      - name: Install Claude Code
+        run: |
+          npm install -g "@anthropic-ai/claude-code@2.1.241"
+          claude --version
+
+      - name: Run review (credential-less; output to /tmp only)
+        id: review
+        timeout-minutes: 25
+        env:
+          ANTHROPIC_BASE_URL: "https://openrouter.ai/api"
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ""
+          ANTHROPIC_MODEL: "z-ai/glm-5.3-flash"
+          CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+        run: |
+          cd repo
+          # never echo the diff or the review — public log
+          set +e
+          claude -p "$(cat <<'PROMPT'
+          Perform a rigorous code review of this pull request. The full diff is in /tmp/review-diff.txt; the repository is checked out at the PR head — read any file for context.
+
+          Focus on:
+          1. Correctness: bugs, race conditions, error handling, edge cases.
+          2. Security: credential hygiene, injection risks, untrusted input handling.
+          3. GitHub Actions semantics: YAML correctness, permissions, concurrency groups.
+          4. Docs accuracy: claims that contradict the code.
+
+          Report findings as a numbered list with severity tags [P0]/[P1]/[P2]/[P3] and file:line citations. Ignore: credentials tracked in git (deliberate git-is-disk policy for this exploration repo) and informal tone. If nothing significant is wrong, say so plainly — do not pad. Your entire response is posted verbatim as the PR review; write it for that audience.
+          PROMPT
+          )" \
+            --output-format json \
+            --max-turns 40 \
+            --permission-mode plan \
+            --disallowedTools "WebFetch,WebSearch" \
+            > /tmp/review-result.json 2>/tmp/review.stderr
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ] || ! jq -e '.result' /tmp/review-result.json >/dev/null 2>&1; then
+            echo "::error::review step failed (rc=$RC) — metadata only:" >&2
+            jq -r '"subtype=\(.subtype // "n/a") is_error=\(.is_error // "n/a")"' /tmp/review-result.json 2>/dev/null || echo "(no parseable JSON)"
+            exit 1
+          fi
+          jq -r '.result' /tmp/review-result.json > /tmp/review.md
+          echo "review produced: $(wc -c < /tmp/review.md) bytes (content not echoed — private deliverable)"
+          jq '{subtype, is_error, num_turns, duration_ms, usage: {output_tokens: .usage.output_tokens}}' /tmp/review-result.json
+
+      - name: POST review to the private PR (PAT; result never in public log)
+        env:
+          GH_PAT_PRIVATE: ${{ secrets.GH_PAT_PRIVATE }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          pr = os.environ["PR_NUMBER"]
+          pat = os.environ["GH_PAT_PRIVATE"]
+          review = open("/tmp/review.md").read()
+          if not review.strip():
+              print("empty review — not posting"); raise SystemExit(0)
+          body = {"body": f"**Claude review (public-compute executor)** — head `{os.environ['HEAD_SHA'][:7]}`\n\n{review}", "event": "COMMENT"}
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/xfnwfpho1/cc-gha-exploration/pulls/{pr}/reviews",
+              method="POST",
+              headers={"Authorization": f"token {pat}", "Accept": "application/vnd.github+json",
+                       "Content-Type": "application/json"},
+              data=json.dumps(body).encode())
+          with urllib.request.urlopen(req) as r:
+              out = json.loads(r.read())
+              print(f"review posted: id={out['id']} state={out['state']} (url not echoed — private repo)")
+          EOF
+
+      - name: Report (metadata only)
+        if: always()
+        run: echo "review pipeline done — all content shipped privately; only metadata in this public log"

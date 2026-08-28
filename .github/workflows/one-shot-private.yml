@@ -1,0 +1,285 @@
+# One-shot CC task on FREE PUBLIC compute — results land PRIVATELY.
+#
+# The Task-34 public-compute pattern (research/PUBLIC-COMPUTE.md) applied to
+# the single-agent one-shot vehicle (port of cc-gha-exploration/one-shot-persist.yml):
+#   - compute: this PUBLIC repo (free, unlimited standard runners)
+#   - code + results: the PRIVATE repo (cc-gha-exploration), reached ONLY via
+#     repo-scoped deploy keys (DEPLOY_KEY_PRIVATE / DEPLOY_KEY_KIT) — no PAT in
+#     this workflow at all. Deploy keys grant git clone/fetch/push on exactly
+#     one repo each and have ZERO API surface (proven: deploy-key-smoke run
+#     33142116322 — unauthenticated private-repo API read is 404).
+#   - the session corpus persists to the private repo's `agent-sessions`
+#     branch (same accumulating merge-commit mechanics as the original).
+#
+# CREDENTIAL LIFECYCLE (the agent runs with bypassPermissions — it can read any
+# file in $HOME): SSH private keys exist ONLY during the two steps that need
+# git network access (clone/restore, persist) and are SHREDDED before the
+# agent step. The agent can git add/commit locally but cannot push anywhere.
+#
+# LOG HYGIENE (public logs are world-readable — this is the contract):
+#   - the dispatch INPUT `prompt` is visible in the run UI by design: only
+#     dispatch NON-SENSITIVE prompts (PUBLIC-COMPUTE.md §4). No secrets in
+#     prompts — ever.
+#   - the agent RESULT is never echoed, never step-summarized: it exists only
+#     in /tmp (runner-local) and in the private agent-sessions push.
+#   - stderr from the agent is never dumped (may quote prompt content).
+#   - only opaque metadata (session id, token counts, durations) is printed.
+#
+# Trigger surface: workflow_dispatch only (owner/write actors) — NEVER add
+# pull_request_target / issue_comment / workflow_run here (README security contract).
+name: One-Shot Private (public compute)
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Task prompt for the agent (NON-SENSITIVE only — visible in the public run UI)"
+        required: true
+        default: "Analyze the codebase architecture and write ARCHITECTURE.md"
+      resume_session_id:
+        description: "(Optional) session UUID to resume — find IDs on the private repo's agent-sessions branch (.agent-sessions/latest.json)"
+        required: false
+        default: ""
+      max_context_tokens:
+        description: "(Optional) CLAUDE_CODE_MAX_CONTEXT_TOKENS override (1000000 = 1M, validated E5)"
+        required: false
+        default: ""
+      cc_version:
+        description: "(Optional) @anthropic-ai/claude-code version pin, strict semver; 'latest' to float"
+        required: false
+        default: "2.1.241"
+      max_turns:
+        description: "Agent turn budget (deep research needs 30-40; default 20)"
+        required: false
+        default: "20"
+      branch:
+        description: "(Optional) private-repo branch to work on (default: main)"
+        required: false
+        default: "main"
+
+permissions: {}  # no GITHUB_TOKEN use at all — deploy keys do everything
+
+concurrency:
+  group: executor-one-shot
+  cancel-in-progress: false
+
+jobs:
+  one-shot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Clone private repo + restore session state (keys live only in this step)
+        env:
+          DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+          DK_KIT: ${{ secrets.DEPLOY_KEY_KIT }}
+          RESUME_SID: ${{ github.event.inputs.resume_session_id }}
+          BRANCH: ${{ github.event.inputs.branch }}
+        run: |
+          # --- ssh: one key per host alias (SSH picks the key before the repo
+          # path is known, so two github.com identities need two aliases)
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DK_PRIVATE" > ~/.ssh/id_private
+          printf '%s\n' "$DK_KIT"      > ~/.ssh/id_kit
+          chmod 600 ~/.ssh/id_private ~/.ssh/id_kit
+          ssh-keyscan -t ed25519 github.com > ~/.ssh/known_hosts 2>/dev/null
+          cat > ~/.ssh/config <<'CFG'
+          Host gh-private
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/id_private
+            IdentitiesOnly yes
+          Host gh-kit
+            HostName github.com
+            User git
+            IdentityFile ~/.ssh/id_kit
+            IdentitiesOnly yes
+          CFG
+          git config --global url."git@gh-kit:xfnwfpho1/claudecode-zai-agent-kit.git".insteadOf \
+            "https://github.com/xfnwfpho1/claudecode-zai-agent-kit.git"
+
+          # --- clone (sanitized single-branch) + submodule via its own key
+          git clone --single-branch --branch "${BRANCH:-main}" \
+            git@gh-private:xfnwfpho1/cc-gha-exploration.git repo
+          cd repo
+          git submodule update --init
+          echo "cloned: $(git rev-parse --short HEAD) ($(git ls-tree -r HEAD --name-only | wc -l) files)"
+
+          # --- restore: deterministic wipe + validated minimal set (E1/E2)
+          rm -rf ~/.claude && mkdir -p ~/.claude
+          # zero-lease protection: tell 'branch absent' from 'fetch failed'
+          if ! LSR_OUT=$(git ls-remote --heads origin agent-sessions 2>/tmp/lsr.err); then
+            echo "::error::ls-remote failed: cannot tell first-run from unreachable branch — aborting" >&2
+            exit 1
+          fi
+          if [ -n "$LSR_OUT" ]; then
+            if ! git fetch origin "+agent-sessions:refs/remotes/origin/agent-sessions" --depth=1; then
+              echo "::error::agent-sessions exists but fetch failed — aborting to protect the corpus" >&2
+              exit 1
+            fi
+          else
+            echo "agent-sessions branch not found (first run?)"
+          fi
+          RESTORED=0
+          if git rev-parse --verify origin/agent-sessions >/dev/null 2>&1; then
+            if git checkout origin/agent-sessions -- .agent-sessions/ && [ -d .agent-sessions/projects ]; then
+              cp -r .agent-sessions/projects ~/.claude/projects
+              RESTORED=1
+              echo "restored session state from agent-sessions"
+            fi
+          fi
+          # a requested resume that cannot be restored is deterministic: fail loud
+          if [ -n "$RESUME_SID" ]; then
+            SID_PRESENT=$(find ~/.claude/projects -type f -name '*.jsonl' -printf '%f\n' 2>/dev/null | grep -Fx "${RESUME_SID}.jsonl" || true)
+            if [ "$RESTORED" != "1" ] || [ -z "$SID_PRESENT" ]; then
+              echo "::error::resume_session_id not found in restored state — refusing a silent fresh start" >&2
+              exit 1
+            fi
+            echo "resume target verified: ${RESUME_SID}.jsonl"
+          fi
+
+          # --- SHRED the keys: the agent step below runs with bypassPermissions
+          # and must not be able to read or exfiltrate them.
+          rm -f ~/.ssh/id_private ~/.ssh/id_kit
+          echo "deploy keys shredded; agent will run credential-less"
+
+      - name: Install Claude Code
+        env:
+          CC_VERSION: ${{ github.event.inputs.cc_version }}
+        run: |
+          # strict semver gate (cc_version is interpolated into an npm spec)
+          if [ -n "$CC_VERSION" ] && [ "$CC_VERSION" != "latest" ] \
+             && ! printf '%s' "$CC_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::cc_version must be strict semver or 'latest'" >&2
+            exit 1
+          fi
+          npm install -g "@anthropic-ai/claude-code@${CC_VERSION}"
+          claude --version
+
+      - name: "Run Agent Task (credential-less: no SSH keys, no tokens)"
+        id: agent
+        timeout-minutes: 25
+        env:
+          ANTHROPIC_BASE_URL: "https://openrouter.ai/api"
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ""
+          ANTHROPIC_MODEL: "z-ai/glm-5.3-flash"
+          CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1"
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          PROMPT: ${{ github.event.inputs.prompt }}
+          RESUME_SID: ${{ github.event.inputs.resume_session_id }}
+          MAX_CTX: ${{ github.event.inputs.max_context_tokens }}
+          MAX_TURNS: ${{ github.event.inputs.max_turns }}
+        run: |
+          cd repo
+          # deadline pacing (Action 3): wall-clock signal before the step timeout
+          OX_AGENT_DEADLINE_UTC=$(date -u -d "+$(( 25 * 60 - 120 )) seconds" "+%Y-%m-%dT%H:%M:%SZ")
+          export OX_AGENT_DEADLINE_UTC
+          RESUME_ARGS=()
+          [ -n "$RESUME_SID" ] && RESUME_ARGS=(--resume "$RESUME_SID")
+          [ -n "$MAX_CTX" ] && export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$MAX_CTX"
+          PROMPT="## Deadline
+          OX_AGENT_DEADLINE_UTC=${OX_AGENT_DEADLINE_UTC} - before your final write-up, run: date -u. If less than 5 minutes remain, write a PARTIAL result marked [INCOMPLETE - hit deadline] instead of being killed mid-write.
+
+          ${PROMPT}"
+          # LOG HYGIENE: stdout+stderr never reach the public log; result JSON
+          # goes to /tmp only. On failure we print METADATA ONLY.
+          set +e
+          claude -p "$PROMPT" \
+            "${RESUME_ARGS[@]}" \
+            --output-format json \
+            --max-turns "${MAX_TURNS:-20}" \
+            --permission-mode bypassPermissions \
+            --disallowedTools "WebFetch,WebSearch" \
+            > /tmp/result.json 2>/tmp/agent.stderr
+          RC=$?
+          set -e
+          if [ $RC -ne 0 ] || ! jq -e '.session_id' /tmp/result.json >/dev/null 2>&1; then
+            echo "::error::agent step failed (rc=$RC). Result-file metadata only (no content echoed — public log):" >&2
+            jq -r '"subtype=\(.subtype // "n/a") is_error=\(.is_error // "n/a") result_text_len=\((.result // "") | length)"' /tmp/result.json 2>/dev/null || echo "(no parseable result JSON)"
+            exit 1
+          fi
+          SESSION_ID=$(jq -r '.session_id' /tmp/result.json)
+          echo "SESSION_ID=$SESSION_ID" >> "$GITHUB_OUTPUT"
+          # opaque usage metadata only (no prompt/response content)
+          jq '{session_id, subtype, is_error, num_turns, duration_ms, usage: {input_tokens: .usage.input_tokens, output_tokens: .usage.output_tokens, cache_read_input_tokens: .usage.cache_read_input_tokens}}' /tmp/result.json
+
+      - name: Persist session state to the PRIVATE repo (keys re-materialized, shredded after)
+        if: always()
+        env:
+          DK_PRIVATE: ${{ secrets.DEPLOY_KEY_PRIVATE }}
+          SESSION_ID: ${{ steps.agent.outputs.SESSION_ID }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          cd repo
+          if [ ! -d ~/.claude/projects ]; then
+            echo "no ~/.claude/projects (agent never started); skipping persist"
+            exit 0
+          fi
+          # re-materialize the private key for the fetch/push
+          printf '%s\n' "$DK_PRIVATE" > ~/.ssh/id_private
+          chmod 600 ~/.ssh/id_private
+          trap 'rm -f ~/.ssh/id_private' EXIT
+          git config user.name "executor-agent"
+          git config user.email "executor-agent@users.noreply.github.com"
+          mkdir -p .agent-sessions
+          rm -rf .agent-sessions/projects
+          cp -r ~/.claude/projects .agent-sessions/projects
+          SID="${SESSION_ID:-}"
+          if [ -n "$SID" ] && [ "$SID" != "unknown" ]; then
+            # the task prompt is intentionally NOT stored (it is public
+            # metadata of this run; the private pointer carries IDs only)
+            jq -n --arg sid "$SID" --arg run_id "$RUN_ID" \
+              --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              '{session_id: $sid, executor_run_id: $run_id, timestamp: $ts}' \
+              > .agent-sessions/latest.json
+          else
+            echo "run_id=$RUN_ID outcome=failed" >> .agent-sessions/failed-runs.log
+          fi
+          # carry-forward union (concurrent writers' files survive)
+          carry_forward() {
+            if git rev-parse --verify origin/agent-sessions >/dev/null 2>&1; then
+              git ls-tree -r --name-only origin/agent-sessions | while IFS= read -r f; do
+                [ -e "$f" ] || git checkout origin/agent-sessions -- "$f" 2>/dev/null || true
+              done
+            fi
+          }
+          # the agent step may have raced a private-repo persist: refetch the tip
+          git fetch origin "+agent-sessions:refs/remotes/origin/agent-sessions" --depth=1 2>/dev/null || true
+          carry_forward
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing to commit; session state unchanged"
+            exit 0
+          fi
+          git commit -m "executor: session ${SID:-unknown} (public run $RUN_ID)"
+          # append-only merge onto the fetched tip (same as the private variant)
+          if git rev-parse --verify origin/agent-sessions >/dev/null 2>&1; then
+            MERGE_PARENT=$(git rev-parse origin/agent-sessions)
+            NEW_COMMIT=$(git commit-tree HEAD^{tree} -p HEAD -p "$MERGE_PARENT" -m "executor: session ${SID:-unknown} (public run $RUN_ID) [merge]")
+            git update-ref refs/heads/session-head "$NEW_COMMIT"
+          else
+            git update-ref refs/heads/session-head HEAD
+          fi
+          if git push origin refs/heads/session-head:agent-sessions; then
+            echo "session state appended to the private agent-sessions branch"
+          else
+            echo "push rejected (remote moved); re-syncing and retrying once"
+            git fetch origin "+agent-sessions:refs/remotes/origin/agent-sessions" --depth=1
+            carry_forward
+            git add -A
+            git diff --cached --quiet || git commit -m "executor: carry-forward (public run $RUN_ID)"
+            MERGE_PARENT=$(git rev-parse origin/agent-sessions)
+            NEW_COMMIT=$(git commit-tree HEAD^{tree} -p HEAD -p "$MERGE_PARENT" -m "executor: session ${SID:-unknown} (public run $RUN_ID) [merge]")
+            git update-ref refs/heads/session-head "$NEW_COMMIT"
+            git push origin refs/heads/session-head:agent-sessions
+          fi
+
+      - name: Report (metadata only — result lives privately)
+        if: always()
+        env:
+          SESSION_ID: ${{ steps.agent.outputs.SESSION_ID }}
+        run: |
+          echo "### Executor run complete (metadata)"
+          echo "- session id: \`${SESSION_ID:-unknown}\`"
+          echo "- result + transcripts: private repo agent-sessions branch (NOT shown here — public log)"
+          echo "- next step: resume privately with resume_session_id=\`${SESSION_ID:-unknown}\`"
