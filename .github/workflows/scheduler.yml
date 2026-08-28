@@ -19,7 +19,8 @@
 #      the private repo's agent workflows), posted as a `[turn failed: run N]`
 #      notice comment on that issue (never a silent drop), and — for worker
 #      agents — trigger an immediate recovery sweep instead of waiting out the
-#      40-min stall window. Circuit breaker: ≥3 failure notices in 6h on one
+#      40-min stall window. Window is 95 min (2x cadence: the schedule is
+#      intermittent; run-id dedup makes overlap free). Circuit breaker: ≥3 failure notices in 6h on one
 #      issue → notify-only (stop auto-recovery; human attention required).
 #   3. BOARD SYNC (new): the per-issue state (In Progress / Stalled / Idle /
 #      Failed + agent-on-hook) is mirrored onto the Projects v2 board — the
@@ -105,8 +106,12 @@ jobs:
           CUTOFF=$(date -u -d '-95 min' +%Y-%m-%dT%H:%M:%SZ)
           while read -r WF AGENT_ID; do
             [ -n "$WF" ] || continue
-            gh run list -R "${PRIVATE_REPO}" --workflow "$WF" --limit 20 \
-              --json databaseId,name,conclusion,createdAt 2>/dev/null \
+            if ! RUNS_JSON=$(gh run list -R "${PRIVATE_REPO}" --workflow "$WF" --limit 20 \
+                --json databaseId,name,conclusion,createdAt 2>/dev/null); then
+              echo "::warning::run list failed for ${WF} — failure watch may be blind for ${AGENT_ID} this cycle"
+              continue
+            fi
+            printf '%s' "$RUNS_JSON" \
               | jq -c --arg cutoff "$CUTOFF" --arg agent "$AGENT_ID" \
                   '.[] | select(.conclusion == "failure" and .createdAt > $cutoff)
                    | {run_id: .databaseId, agent: $agent,
@@ -214,7 +219,8 @@ jobs:
                  + ($f | to_entries
                      | map(select((.key | tonumber) as $n | ($board | map(.issue) | index($n)) == null)
                           | {issue: (.key | tonumber), status: "Failed", agent: .value.agent})))
-            ' /tmp/board-state.jsonl > /tmp/board-state-merged.jsonl 2>/dev/null && mv /tmp/board-state-merged.jsonl /tmp/board-state.jsonl \
+            ' /tmp/board-state.jsonl 2>/dev/null | jq -c '.[]' > /tmp/board-state-merged.jsonl \
+              && mv /tmp/board-state-merged.jsonl /tmp/board-state.jsonl \
               || echo "board merge: kept unmerged state (${?})"
           fi
           echo "board state: $(wc -l < /tmp/board-state.jsonl 2>/dev/null || echo 0) active issue(s)"
@@ -242,7 +248,7 @@ jobs:
           # breaker — a sweep that keeps dying would be re-dispatched every
           # 30 min for the whole 40–360-min stall window. Same rule as the
           # failure-watch path: ≥3 turn-failed notices in 6h → stop, human.
-          NOTICES=$(gh api "repos/${PRIVATE_REPO}/issues/${ISSUE}/comments?since=$(date -u -d '-6 hours' +%Y-%m-%dT%H:%M:%SZ)&per_page=100" 2>/dev/null \
+          NOTICES=$(gh api --paginate "repos/${PRIVATE_REPO}/issues/${ISSUE}/comments?since=$(date -u -d '-6 hours' +%Y-%m-%dT%H:%M:%SZ)&per_page=100" 2>/dev/null \
             | jq '[.[] | select(.body | startswith("**[turn failed:"))] | length' || echo 0)
           if [ "${NOTICES:-0}" -ge 3 ]; then
             echo "issue #${ISSUE}: circuit breaker open (${NOTICES} failure notices/6h) — stall dispatch suppressed, human attention required"
@@ -269,7 +275,7 @@ jobs:
       - name: Failure notices + recovery dispatches
         # always(): board-sync or dispatch failures upstream must not suppress
         # failure notices (they are the "never a silent drop" guarantee).
-        if: always() && steps.scan.outputs.failed_count != '0'
+        if: always() && steps.scan.outputs.failed_count != '' && steps.scan.outputs.failed_count != '0'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_PRIVATE }}
           STALLED_ISSUE: ${{ steps.scan.outputs.issue }}
