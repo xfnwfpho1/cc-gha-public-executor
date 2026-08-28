@@ -29,13 +29,23 @@
 #   - GraphQL error TYPES may be logged (e.g. INSUFFICIENT_SCOPES), never data
 set -euo pipefail
 
-STATE_FILE=${1:?usage: board-sync.sh <state-file.jsonl>}
+STATE_FILE=${1:?usage: board-sync.sh <state-file.jsonl> [scanned-issues-file]}
+SCANNED_FILE=${2:-}   # issues confirmed scanned this pass (removal guard — see below)
 PRIVATE_REPO=${PRIVATE_REPO:?}
 ROSTER=${ROSTER:?}                  # comma-separated agent ids (registry-driven)
 BOARD_NUMBER=${BOARD_NUMBER:-1}     # the "A2A Swarm Board" user project
 BOARD_TITLE=${BOARD_TITLE:-A2A Swarm Board}
 # BOARD_PAT (project-scoped) overrides GH_PAT_PRIVATE when present.
 TOKEN=${BOARD_PAT:-${GH_PAT_PRIVATE:?need GH_PAT_PRIVATE or BOARD_PAT}}
+
+# Missing/empty state file = a legitimately quiet repo (the scheduler now
+# ALWAYS creates it) — but treat a MISSING file as skip-not-wipe anyway
+# (defense in depth, review 36-r1/r3 P1: an accidental absence must not
+# mass-remove every board item).
+if [ ! -f "$STATE_FILE" ]; then
+  echo "board sync: SKIPPED — state file missing (scan did not run or passed no path). Scheduler continues normally."
+  exit 0
+fi
 
 GQL() { # GQL <payload-json> → GraphQL response on stdout; empty string on transport failure
   # curl, NOT `gh api graphql`: the live scheduler run (33186444016) showed gh
@@ -46,15 +56,6 @@ GQL() { # GQL <payload-json> → GraphQL response on stdout; empty string on tra
   curl -sS -X POST https://api.github.com/graphql \
     -H "Authorization: bearer ${TOKEN}" -H "Content-Type: application/json" \
     --data-binary "$1" --max-time 30 2>/dev/null || true
-}
-
-# jq-with-fallback: never let a malformed/empty response crash the sync (jq's
-# null-iteration errors exit 5 — and `set -e` is SUPPRESSED inside functions
-# invoked via command substitution, a verified bash trap — so every parse
-# needs an explicit fallback).
-jqf() { # jqf <filter> [jq args...] — reads stdin
-  local FILTER=$1; shift
-  jq -r "$FILTER" "$@" 2>/dev/null || echo ""
 }
 
 # ---------- 0. capability gate (the graceful-skip contract) ----------
@@ -123,6 +124,14 @@ if [ -z "$ITEMS" ] || [ -z "$OPTIONS_RES" ]; then
   echo "board sync: item/option query failed (transport) — skipping this cycle." >&2
   exit 0
 fi
+# Non-empty but INVALID items payload (GraphQL errors / truncation) must not
+# masquerade as an empty board — that would re-ADD every issue as a duplicate
+# (Projects v2 accepts duplicates; the twin is invisible to later runs —
+# review 36-r1 P2).
+if ! printf '%s' "$ITEMS" | jq -e '.data.node.items.nodes' >/dev/null 2>&1; then
+  echo "board sync: items payload failed validation — skipping this cycle (no board change)." >&2
+  exit 0
+fi
 
 opt_id() { # opt_id <field name> <option name> → option id ("" on any parse failure)
   # Hardened: a malformed/empty OPTIONS_RES must degrade to "no update",
@@ -140,6 +149,7 @@ while IFS=$'\t' read -r ITEM_ID INUM CST CAG; do
   BOARD_STATUS[$INUM]=$CST
   BOARD_AGENT[$INUM]=$CAG
 done < <(printf '%s' "$ITEMS" | jq -r '.data.node.items.nodes[]
+  | select((.content.number // 0) > 0)   # draft items (number 0) are operator-owned — never manage them
   | [.id, (.content.number // 0),
      ([.fieldValues.nodes[] | select(.field.name == "Status") | .name][0] // ""),
      ([.fieldValues.nodes[] | select(.field.name == "Agent") | .name][0] // "")] | @tsv' 2>/dev/null || true)
@@ -168,21 +178,41 @@ while IFS= read -r LINE; do
     if [ -n "$WANT" ] && [ "$WANT" != "$CUR" ]; then
       OID=$(opt_id "$FLD" "$WANT")
       if [ -n "$OID" ]; then
-        GQL "{\"query\": \"mutation(\$p: ID!, \$i: ID!, \$f: ID!, \$v: String!) { updateProjectV2ItemFieldValue(input: {projectId: \$p, itemId: \$i, fieldId: \$f, value: {singleSelectOptionId: \$v}}) { projectV2Item { id } } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"i\": \"${ITEM_ID}\", \"f\": \"${FID}\", \"v\": \"${OID}\"}}" >/dev/null
-        UPDATED=$((UPDATED+1))
+        UPD_RES=$(GQL "{\"query\": \"mutation(\$p: ID!, \$i: ID!, \$f: ID!, \$v: String!) { updateProjectV2ItemFieldValue(input: {projectId: \$p, itemId: \$i, fieldId: \$f, value: {singleSelectOptionId: \$v}}) { projectV2Item { id } } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"i\": \"${ITEM_ID}\", \"f\": \"${FID}\", \"v\": \"${OID}\"}}")
+        # verify the mutation actually landed (review 36-r3 P3: counting
+        # regardless made GraphQL errors look like healthy syncs)
+        if printf '%s' "$UPD_RES" | jq -e '.data.updateProjectV2ItemFieldValue' >/dev/null 2>&1; then
+          UPDATED=$((UPDATED+1))
+        else
+          echo "board sync: field update for issue #${NUM} (${FLD}=${WANT}) failed — retried next cycle" >&2
+        fi
       fi
     fi
   done
   KEPT=$((KEPT+1))
 done < "$STATE_FILE"
 
-# remove items whose issue left the active set (closed / no markers anymore)
-STATE_NUMS=$(jq -r '.issue' "$STATE_FILE" 2>/dev/null | sort -n | paste -sd' ')
+# remove items whose issue left the active set. GUARD (review 36-r3 P2): an
+# item is removed ONLY if its issue was CONFIRMED scanned this pass (present
+# in the scanned-set file) and is not agent-active — a partial/failed scan
+# (transport errors, issue-list truncation) leaves unscanned items untouched.
+# Without the guard, one bad scan silently wipes the board.
+STATE_NUMS=$(jq -r '.issue // empty' "$STATE_FILE" 2>/dev/null | sort -n | paste -sd' ' || true)
+SCANNED_NUMS=""
+if [ -n "$SCANNED_FILE" ] && [ -f "$SCANNED_FILE" ]; then
+  SCANNED_NUMS=$(sort -n "$SCANNED_FILE" | uniq | paste -sd' ' || true)
+fi
 for INUM in "${!BOARD_ITEM_ID[@]}"; do
-  if ! printf ' %s ' "$STATE_NUMS" | grep -q " ${INUM} "; then
-    GQL "{\"query\": \"mutation(\$p: ID!, \$i: ID!) { deleteProjectV2Item(input: {projectId: \$p, itemId: \$i}) { deletedItemId } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"i\": \"${BOARD_ITEM_ID[$INUM]}\"}}" >/dev/null
-    REMOVED=$((REMOVED+1))
-    echo "board sync: - issue #${INUM} (no longer active)"
+  if [ -n "$SCANNED_NUMS" ] \
+     && printf ' %s ' "$SCANNED_NUMS" | grep -q " ${INUM} " \
+     && ! printf ' %s ' "$STATE_NUMS" | grep -q " ${INUM} "; then
+    DEL_RES=$(GQL "{\"query\": \"mutation(\$p: ID!, \$i: ID!) { deleteProjectV2Item(input: {projectId: \$p, itemId: \$i}) { deletedItemId } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"i\": \"${BOARD_ITEM_ID[$INUM]}\"}}")
+    if printf '%s' "$DEL_RES" | jq -e '.data.deleteProjectV2Item' >/dev/null 2>&1; then
+      REMOVED=$((REMOVED+1))
+      echo "board sync: - issue #${INUM} (no longer active)"
+    else
+      echo "board sync: removal of issue #${INUM} failed — retried next cycle" >&2
+    fi
   fi
 done
 
