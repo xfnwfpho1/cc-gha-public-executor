@@ -38,9 +38,14 @@ BOARD_TITLE=${BOARD_TITLE:-A2A Swarm Board}
 TOKEN=${BOARD_PAT:-${GH_PAT_PRIVATE:?need GH_PAT_PRIVATE or BOARD_PAT}}
 
 GQL() { # GQL <payload-json> → GraphQL response on stdout; empty string on transport failure
-  local RES
-  RES=$(printf '%s' "$1" | gh api graphql --input - 2>/dev/null || true)
-  printf '%s' "${RES:-}"
+  # curl, NOT `gh api graphql`: the live scheduler run (33186444016) showed gh
+  # returning empty for the capability probe where the identical curl call
+  # returns the INSUFFICIENT_SCOPES body (audited live — the scope-skip
+  # message must be precise or the operator cannot tell transport from
+  # capability). curl's body handling is deterministic either way.
+  curl -sS -X POST https://api.github.com/graphql \
+    -H "Authorization: bearer ${TOKEN}" -H "Content-Type: application/json" \
+    --data-binary "$1" --max-time 30 2>/dev/null || true
 }
 
 # jq-with-fallback: never let a malformed/empty response crash the sync (jq's
