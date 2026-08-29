@@ -115,7 +115,8 @@ jobs:
               | jq -c --arg cutoff "$CUTOFF" --arg agent "$AGENT_ID" \
                   '.[] | select(.conclusion == "failure" and .createdAt > $cutoff)
                    | {run_id: .databaseId, agent: $agent,
-                      issue: ((.name | capture("^issue-(?<n>[0-9]+)")? | .n | tonumber) // null)}
+                      kind: ((.name | capture("^(?<k>issue|discussion)-")? | .k) // null),
+                      issue: ((.name | capture("^(?:issue|discussion)-(?<n>[0-9]+)")? | .n | tonumber) // null)}
                    | select(.issue != null)' >> /tmp/failed-runs.jsonl || true
           done < <(printf '%s' "$REGISTRY" | jq -r '.agents[] | "\(.workflow) \(.agent_id)"')
           if [ -s /tmp/failed-runs.jsonl ]; then
@@ -222,8 +223,11 @@ jobs:
           # ---- merge failure overrides into the board state ----------------
           # Failed > any conversation-derived status; failed issues missing a
           # board line (e.g. prefix-triggered turn without markers) get one.
+          # Task 37: discussion failures are EXCLUDED — the board mirrors
+          # the issue namespace only (discussion numbers are a different
+          # sequence; merging them would corrupt issue-numbered rows).
           if [ "$(jq 'length' /tmp/failed.json)" -gt 0 ]; then
-            jq -s --argjson failed "$(cat /tmp/failed.json)" '
+            jq -s --argjson failed "$(jq '[.[] | select((.kind // "issue") == "issue")]' /tmp/failed.json)" '
               . as $board
               | ($failed | map({key: (.issue | tostring), value: .}) | from_entries) as $f
               | ($board | map(if ($f[(.issue | tostring)] != null) then .status = "Failed" else . end)
@@ -302,8 +306,35 @@ jobs:
           }
           jq -c '.[]' /tmp/failed.json | while read -r REC; do
             ISSUE=$(printf '%s' "$REC" | jq -r '.issue')
+            KIND=$(printf '%s' "$REC" | jq -r '.kind // "issue"')
             RUN_ID=$(printf '%s' "$REC" | jq -r '.run_id')
             AGENT_ID=$(printf '%s' "$REC" | jq -r '.agent')
+            # Thread-kind split (Task 37): discussion turns are noticed on
+            # their discussion (GraphQL) but are NOT sweep-dispatched (the
+            # synthetic sweep operates on the issue namespace) and NOT
+            # board-merged (the board mirrors issues this session).
+            if [ "$KIND" = "discussion" ]; then
+              # dedup on the discussion's comments (REST honors since)
+              RECENT=$(gh api --paginate "repos/${PRIVATE_REPO}/discussions/${ISSUE}/comments?since=$(date -u -d '-6 hours' +%Y-%m-%dT%H:%M:%SZ)&per_page=100" 2>/dev/null || echo '[]')
+              DEDUP=$(printf '%s' "$RECENT" | jq --arg tag "**[turn failed: run ${RUN_ID}]**" '[.[] | select(.body | startswith($tag))] | length')
+              if [ "${DEDUP:-0}" -gt 0 ]; then
+                echo "discussion #${ISSUE}: run ${RUN_ID} already noticed — skip"
+                continue
+              fi
+              DNODE=$(gh api "repos/${PRIVATE_REPO}/discussions/${ISSUE}" --jq .node_id 2>/dev/null || echo "")
+              if [ -n "$DNODE" ]; then
+                jq -n --arg d "$DNODE" --arg b "**[turn failed: run ${RUN_ID}]** (auto — this notice triggers no agent turns) The ${AGENT_ID} turn started from this discussion failed in CI (infra/transient — not a refusal). The run log is in the private repo's Actions tab (run ${RUN_ID})." \
+                  '{query: "mutation($d: ID!, $b: String!) { addDiscussionComment(input: {discussionId: $d, body: $b}) { comment { id } } }", variables: {d: $d, b: $b}}' \
+                  | curl -sS -X POST https://api.github.com/graphql \
+                      -H "Authorization: bearer ${GH_TOKEN}" -H "Content-Type: application/json" \
+                      --data-binary @- --max-time 30 >/dev/null \
+                  && echo "discussion #${ISSUE}: posted failure notice for run ${RUN_ID} (${AGENT_ID})" \
+                  || echo "::warning::discussion failure notice for #${ISSUE} failed to post — the Actions red X remains the signal"
+              else
+                echo "::warning::discussion #${ISSUE} node id unavailable — notice skipped this cycle"
+              fi
+              continue
+            fi
             # the stall dispatch (same scan) already covers this issue
             if [ "$ISSUE" = "${STALLED_ISSUE}" ]; then
               echo "issue #${ISSUE}: failure covered by the stall dispatch — notice only"
