@@ -94,7 +94,7 @@ jobs:
           : > /tmp/board-state.jsonl
           : > /tmp/scanned-issues
 
-          # ---- failure watch: failed agent-workflow runs in the window ------
+          # ---- failure watch: failed agent-workflow runs in the window (95 min) ------
           # Attribution key: the private repo's agent workflows carry
           # run-name "issue-N · <agent>" (Task 36); runs older than that
           # change have no issue in their name and are unattributable (the
