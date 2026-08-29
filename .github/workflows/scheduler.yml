@@ -357,7 +357,7 @@ jobs:
               echo "issue #${ISSUE}: circuit breaker open (${NOTICES} notices/6h) — no dispatch"
               continue
             fi
-            if post_notice "$ISSUE" "**[turn failed: run ${RUN_ID}]** (auto — this notice triggers no agent turns) The ${AGENT_ID} turn started from this thread failed in CI (infra/transient — not a refusal; refusals post guard notices instead). The run log is in the private repo's Actions tab (run ${RUN_ID})."; then
+            if post_notice "$ISSUE" "**[turn failed: run ${RUN_ID}]** (auto — this notice triggers no agent turns) The ${AGENT_ID} turn started from this thread failed in CI — infra/transient OR a permission refusal (the gate exits 1 on write-access violations; refusals of the cap/storm class post guard notices instead). The run log is in the private repo's Actions tab (run ${RUN_ID}) distinguishes them."; then
               echo "issue #${ISSUE}: posted failure notice for run ${RUN_ID} (${AGENT_ID})"
             fi
             # recovery: immediate sweep for WORKER failures (the lead's own
