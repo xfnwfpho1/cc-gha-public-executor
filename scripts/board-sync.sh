@@ -83,7 +83,13 @@ fi
 REQUIRED_STATUS="In Progress,Stalled,Idle,Failed"
 AGENT_OPTIONS="${ROSTER},unassigned"
 
-FIELDS_RES=$(GQL "{\"query\": \"query { node(id: \\\"${PROJECT_ID}\\\") { ... on ProjectV2 { fields(first: 20) { nodes { ... on ProjectV2SingleSelectField { id name options(first: 30) { nodes { name } } } } } } } }\"}")
+# SCHEMA NOTE (live-proven 2026-08-29, first ACTIVE-path run): a field's
+# `options` is a PLAIN LIST (`options { name }`), NOT a connection —
+# `options(first: N) { nodes { ... } }` is a schema error that silently
+# zeroes every field lookup (the fixture mocks had encoded the connection
+# shape and papered over it; only the live run exposed it). The create
+# mutation's option input type is ProjectV2SingleSelectFieldOptionInput.
+FIELDS_RES=$(GQL "{\"query\": \"query { node(id: \\\"${PROJECT_ID}\\\") { ... on ProjectV2 { fields(first: 20) { nodes { ... on ProjectV2SingleSelectField { id name options { name } } } } } } }\"}")
 
 ensure_field() { # ensure_field <name> <comma-separated options> → field id on STDOUT
   local NAME=$1 OPTIONS=$2
@@ -97,17 +103,24 @@ ensure_field() { # ensure_field <name> <comma-separated options> → field id on
   if [ -n "$FID" ]; then
     # Option-set drift → recreate (single-select options can only be set at
     # field creation via public GraphQL — there is no add-option mutation).
-    HAVE=$(printf '%s' "$FIELDS_RES" | jq -r --arg n "$NAME" '[.data.node.fields.nodes[] | select(.name == $n)][0].options.nodes[].name' 2>/dev/null | sort | paste -sd, || true)
+    HAVE=$(printf '%s' "$FIELDS_RES" | jq -r --arg n "$NAME" '[.data.node.fields.nodes[] | select(.name == $n)][0].options[].name' 2>/dev/null | sort | paste -sd, || true)
     if [ "$HAVE" != "$(printf '%s' "$OPTIONS" | tr ',' '\n' | sed '/^$/d' | sort | paste -sd,)" ]; then
       echo "board sync: field '${NAME}' option drift — recreating field (values reset)." >&2
-      GQL "{\"query\": \"mutation(\$p: ID!, \$f: ID!) { deleteProjectV2Field(input: {projectId: \$p, fieldId: \$f}) { deletedFieldId } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"f\": \"${FID}\"}}" >/dev/null
+      # DeleteProjectV2FieldInput takes ONLY fieldId (live-introspected
+      # 2026-08-29 — the projectId form is a schema error now); the payload
+      # returns projectV2Field, not deletedFieldId.
+      GQL "{\"query\": \"mutation(\$f: ID!) { deleteProjectV2Field(input: {fieldId: \$f}) { projectV2Field { ... on ProjectV2FieldCommon { id } } } }\", \"variables\": {\"f\": \"${FID}\"}}" >/dev/null
       FID=""
     fi
   fi
   if [ -z "$FID" ]; then
     local OPTS CREATED
-    OPTS=$(printf '%s' "$OPTIONS" | jq -R -r 'split(",") | map(select(length > 0) | {name: .}) | tojson')
-    CREATED=$(GQL "{\"query\": \"mutation(\$p: ID!, \$n: String!, \$o: [ProjectV2SingleSelectOptionInput!]!) { createProjectV2Field(input: {projectId: \$p, name: \$n, dataType: SINGLE_SELECT, singleSelectOptions: \$o}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"n\": \"${NAME}\", \"o\": ${OPTS}}}")
+    # ProjectV2SingleSelectFieldOptionInput REQUIRES name + color + description
+    # (all non-null — live-proven 2026-08-29: {name} alone is rejected), and
+    # color is a NAMED enum — GRAY|BLUE|GREEN|YELLOW|ORANGE|RED|PINK|PURPLE —
+    # hex strings are rejected. Description = the operator legend.
+    OPTS=$(printf '%s' "$OPTIONS" | jq -R -r 'split(",") | map(select(length > 0)) | map({name: ., color: (if . == "In Progress" then "GREEN" elif . == "Stalled" then "ORANGE" elif . == "Idle" then "GRAY" elif . == "Failed" then "RED" elif . == "unassigned" then "GRAY" else "BLUE" end), description: "board-sync mirror — the issue thread is the source of truth"}) | tojson')
+    CREATED=$(GQL "{\"query\": \"mutation(\$p: ID!, \$n: String!, \$o: [ProjectV2SingleSelectFieldOptionInput!]!) { createProjectV2Field(input: {projectId: \$p, name: \$n, dataType: SINGLE_SELECT, singleSelectOptions: \$o}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"n\": \"${NAME}\", \"o\": ${OPTS}}}")
     FID=$(printf '%s' "$CREATED" | jq -r '.data.createProjectV2Field.projectV2Field.id // empty' 2>/dev/null || true)
     [ -n "$FID" ] || { echo "board sync: could not ensure field '${NAME}' — skipping this cycle." >&2; exit 0; }
   fi
@@ -118,8 +131,11 @@ STATUS_FIELD=$(ensure_field "Status" "$REQUIRED_STATUS")
 AGENT_FIELD=$(ensure_field "Agent" "$AGENT_OPTIONS")
 
 # ---------- 2. current board items + option ids ---------------------------
-ITEMS=$(GQL "{\"query\": \"query { node(id: \\\"${PROJECT_ID}\\\") { ... on ProjectV2 { items(first: 100) { nodes { id content { ... on Issue { number } } fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2Field { name } } } } } } } } } }\"}")
-OPTIONS_RES=$(GQL "{\"query\": \"query { node(id: \\\"${PROJECT_ID}\\\") { ... on ProjectV2 { fields(first: 20) { nodes { ... on ProjectV2SingleSelectField { id name options(first: 30) { nodes { id name } } } } } } } }\"}")
+# fieldValues' `field` is a UNION (ProjectV2FieldConfiguration) — select the
+# name via ... on ProjectV2FieldCommon (ProjectV2Field is not a member;
+# live-proven 2026-08-29).
+ITEMS=$(GQL "{\"query\": \"query { node(id: \\\"${PROJECT_ID}\\\") { ... on ProjectV2 { items(first: 100) { nodes { id content { ... on Issue { number } } fieldValues(first: 10) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { name } } } } } } } } } }\"}")
+OPTIONS_RES=$(GQL "{\"query\": \"query { node(id: \\\"${PROJECT_ID}\\\") { ... on ProjectV2 { fields(first: 20) { nodes { ... on ProjectV2SingleSelectField { id name options { id name } } } } } } }\"}")
 if [ -z "$ITEMS" ] || [ -z "$OPTIONS_RES" ]; then
   echo "board sync: item/option query failed (transport) — skipping this cycle." >&2
   exit 0
@@ -138,7 +154,7 @@ opt_id() { # opt_id <field name> <option name> → option id ("" on any parse fa
   # never crash the scheduler step (verified live: the unhardened form exits 5
   # and takes the whole job down — the exact anti-contract failure).
   printf '%s' "$OPTIONS_RES" | jq -r --arg f "$1" --arg o "$2" \
-    '[.data.node.fields.nodes[] | select(.name == $f)][0].options.nodes[] | select(.name == $o) | .id' 2>/dev/null | head -1 || true
+    '[.data.node.fields.nodes[] | select(.name == $f)][0].options[] | select(.name == $o) | .id' 2>/dev/null | head -1 || true
 }
 
 # ---------- 3. diff state vs board ----------------------------------------
