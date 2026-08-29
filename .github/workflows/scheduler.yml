@@ -208,6 +208,17 @@ jobs:
             echo "no stalls detected"
           fi
 
+          # ---- closed-issue sweep (board hygiene) ---------------------------
+          # The open-issues loop only marks OPEN issues scanned; closed issues
+          # would keep zombie board items forever (scanned-set removal guard
+          # never fires for them). Recently-CLOSED issues join the scanned set
+          # here: definitionally not agent-active, so board-sync retires their
+          # items (the "board shows live work" contract). If an agent still
+          # comments on a closed issue later, the item is simply re-added.
+          CLOSED_COUNT=$(gh issue list -R "${PRIVATE_REPO}" --state closed --limit 10 --json number \
+            --jq '.[] | "\(.number)"' >> /tmp/scanned-issues 2>/dev/null && wc -l < /tmp/scanned-issues || echo 0)
+          echo "closed-issue sweep: scanned-set now ${CLOSED_COUNT} issues (open + recently closed)"
+
           # ---- merge failure overrides into the board state ----------------
           # Failed > any conversation-derived status; failed issues missing a
           # board line (e.g. prefix-triggered turn without markers) get one.
