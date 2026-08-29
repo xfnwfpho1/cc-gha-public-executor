@@ -91,35 +91,50 @@ AGENT_OPTIONS="${ROSTER},unassigned"
 # mutation's option input type is ProjectV2SingleSelectFieldOptionInput.
 FIELDS_RES=$(GQL "{\"query\": \"query { node(id: \\\"${PROJECT_ID}\\\") { ... on ProjectV2 { fields(first: 20) { nodes { ... on ProjectV2SingleSelectField { id name options { name } } } } } } }\"}")
 
+build_opts() { # build_opts <comma-separated options> → JSON array of option inputs
+  # ProjectV2SingleSelectFieldOptionInput REQUIRES name + color + description
+  # (all non-null — live-proven 2026-08-29: {name} alone is rejected), and
+  # color is a NAMED enum — GRAY|BLUE|GREEN|YELLOW|ORANGE|RED|PINK|PURPLE —
+  # hex strings are rejected. Description = the operator legend.
+  printf '%s' "$1" | jq -R -r 'split(",") | map(select(length > 0)) | map({name: ., color: (if . == "In Progress" then "GREEN" elif . == "Stalled" then "ORANGE" elif . == "Idle" then "GRAY" elif . == "Failed" then "RED" elif . == "unassigned" then "GRAY" else "BLUE" end), description: "board-sync mirror — the issue thread is the source of truth"}) | tojson'
+}
+
 ensure_field() { # ensure_field <name> <comma-separated options> → field id on STDOUT
   local NAME=$1 OPTIONS=$2
-  local FID HAVE
+  local FID HAVE WANT
   # NOTE: this function's stdout is a RETURN VALUE (captured by the caller) —
   # all diagnostics MUST go to stderr or they corrupt the returned id.
   # (Verified live in fixture tests: a stray message on stdout BECOMES the
   # field id; the failing mutations then silently no-op — the worst failure
   # mode: looks healthy, does nothing.)
   FID=$(printf '%s' "$FIELDS_RES" | jq -r --arg n "$NAME" '[.data.node.fields.nodes[] | select(.name == $n)][0].id // empty' 2>/dev/null || true)
+  WANT=$(printf '%s' "$OPTIONS" | tr ',' '\n' | sed '/^$/d' | sort | paste -sd,)
   if [ -n "$FID" ]; then
-    # Option-set drift → recreate (single-select options can only be set at
-    # field creation via public GraphQL — there is no add-option mutation).
     HAVE=$(printf '%s' "$FIELDS_RES" | jq -r --arg n "$NAME" '[.data.node.fields.nodes[] | select(.name == $n)][0].options[].name' 2>/dev/null | sort | paste -sd, || true)
-    if [ "$HAVE" != "$(printf '%s' "$OPTIONS" | tr ',' '\n' | sed '/^$/d' | sort | paste -sd,)" ]; then
-      echo "board sync: field '${NAME}' option drift — recreating field (values reset)." >&2
-      # DeleteProjectV2FieldInput takes ONLY fieldId (live-introspected
-      # 2026-08-29 — the projectId form is a schema error now); the payload
-      # returns projectV2Field, not deletedFieldId.
-      GQL "{\"query\": \"mutation(\$f: ID!) { deleteProjectV2Field(input: {fieldId: \$f}) { projectV2Field { ... on ProjectV2FieldCommon { id } } } }\", \"variables\": {\"f\": \"${FID}\"}}" >/dev/null
-      FID=""
+    if [ "$HAVE" != "$WANT" ]; then
+      # Option-set drift → UPDATE the options in place FIRST
+      # (updateProjectV2Field accepts singleSelectOptions — live-proven
+      # 2026-08-29, works even on the project's DEFAULT fields; values whose
+      # option names survive the change are preserved). Only if the update
+      # fails do we fall back to delete+recreate — and DEFAULT fields reject
+      # deletion ("Only custom fields can be deleted"), which is why the
+      # update path must come first.
+      echo "board sync: field '${NAME}' option drift — updating options in place (values with surviving names are kept)." >&2
+      local OPTS UPD
+      OPTS=$(build_opts "$OPTIONS")
+      UPD=$(GQL "{\"query\": \"mutation(\$f: ID!, \$o: [ProjectV2SingleSelectFieldOptionInput!]!) { updateProjectV2Field(input: {fieldId: \$f, singleSelectOptions: \$o}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }\", \"variables\": {\"f\": \"${FID}\", \"o\": ${OPTS}}}")
+      if ! printf '%s' "$UPD" | jq -e '.data.updateProjectV2Field' >/dev/null 2>&1; then
+        echo "board sync: option update for '${NAME}' failed — falling back to delete+recreate (values reset)." >&2
+        # DeleteProjectV2FieldInput takes ONLY fieldId (live-introspected
+        # 2026-08-29 — the projectId form is a schema error now).
+        GQL "{\"query\": \"mutation(\$f: ID!) { deleteProjectV2Field(input: {fieldId: \$f}) { projectV2Field { ... on ProjectV2FieldCommon { id } } } }\", \"variables\": {\"f\": \"${FID}\"}}" >/dev/null
+        FID=""
+      fi
     fi
   fi
   if [ -z "$FID" ]; then
     local OPTS CREATED
-    # ProjectV2SingleSelectFieldOptionInput REQUIRES name + color + description
-    # (all non-null — live-proven 2026-08-29: {name} alone is rejected), and
-    # color is a NAMED enum — GRAY|BLUE|GREEN|YELLOW|ORANGE|RED|PINK|PURPLE —
-    # hex strings are rejected. Description = the operator legend.
-    OPTS=$(printf '%s' "$OPTIONS" | jq -R -r 'split(",") | map(select(length > 0)) | map({name: ., color: (if . == "In Progress" then "GREEN" elif . == "Stalled" then "ORANGE" elif . == "Idle" then "GRAY" elif . == "Failed" then "RED" elif . == "unassigned" then "GRAY" else "BLUE" end), description: "board-sync mirror — the issue thread is the source of truth"}) | tojson')
+    OPTS=$(build_opts "$OPTIONS")
     CREATED=$(GQL "{\"query\": \"mutation(\$p: ID!, \$n: String!, \$o: [ProjectV2SingleSelectFieldOptionInput!]!) { createProjectV2Field(input: {projectId: \$p, name: \$n, dataType: SINGLE_SELECT, singleSelectOptions: \$o}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }\", \"variables\": {\"p\": \"${PROJECT_ID}\", \"n\": \"${NAME}\", \"o\": ${OPTS}}}")
     FID=$(printf '%s' "$CREATED" | jq -r '.data.createProjectV2Field.projectV2Field.id // empty' 2>/dev/null || true)
     [ -n "$FID" ] || { echo "board sync: could not ensure field '${NAME}' — skipping this cycle." >&2; exit 0; }
