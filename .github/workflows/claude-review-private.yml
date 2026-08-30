@@ -128,7 +128,7 @@ jobs:
           ANTHROPIC_BASE_URL: "https://openrouter.ai/api"
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ""
-          ANTHROPIC_MODEL: "z-ai/glm-5.3-flash"
+          ANTHROPIC_MODEL: "${{ vars.REVIEW_MODEL || 'z-ai/glm-5.3-flash' }}"
           CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: "1"
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
           PR_NUMBER: ${{ github.event.client_payload.pr_number }}
